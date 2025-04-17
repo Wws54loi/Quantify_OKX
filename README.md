@@ -25,3 +25,15 @@ www.python.org
 安装依赖
 ```bash
 pip install ccxt
+```
+
+配置 API
+编辑 trading_bot.py，填入你自己的 OKX API 密钥：
+```python
+api_key = '你的API Key'
+secret_key = '你的Secret Key'
+passphrase = '你的Passphrase'
+```
+
+## 启动机器人
+python trading_bot.py
