@@ -27,6 +27,10 @@ www.python.org
 pip install ccxt
 ```
 
+```bash
+pip install pandas
+```
+
 配置 API
 编辑 trading_bot.py，填入你自己的 OKX API 密钥：
 ```python
