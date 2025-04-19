@@ -37,3 +37,5 @@ passphrase = '你的Passphrase'
 
 ## 启动机器人
 python trading_bot.py
+
+![image](https://github.com/user-attachments/assets/59d17a1d-46a1-478b-9c0a-79d201236ec6)
