@@ -6,6 +6,18 @@ api_key = '你的API_KEY'
 secret_key = '你的SECRET_KEY'
 passphrase = '你的API_PASSPHRASE'
 
+# 初始化 OKX 交易所对象
+exchange = ccxt.okx({
+    'apiKey': api_key,
+    'secret': secret_key,
+    'password': passphrase,
+    'enableRateLimit': True,  # 开启限速保护，避免被封IP
+    'proxies': {  # 如果你在中国大陆访问OKX，推荐配置代理
+        'http': 'http://X.X.X.X:XXXX',
+        'https': 'http://X.X.X.X:XXXX',
+    }
+})
+
 symbol = 'BTC/USDT'         # 设置交易对
 threshold = 0.005           # 固定波动阈值（例如 0.5%）
 min_threshold = 0.003       # 最小阈值限制（防止频繁交易）
@@ -38,6 +50,13 @@ while True:
         btc_amount = balance['BTC']['free']
         usdt_amount = balance['USDT']['free']
 
+        # 🧪 打印卖出逻辑条件检查（便于调试）
+        print("🔎 正在检查卖出逻辑是否满足：")
+        print(f"   ✅ 是否持仓（btc_amount > 0）:         {btc_amount > 0}（持有 {btc_amount:.6f} BTC）")
+        print(f"   ✅ 是否记录买入价格（buy_price）:     {buy_price is not None}（买入价: {buy_price}）")
+        print(f"   ✅ 是否达到波动阈值:                  {price_change >= threshold}（当前涨幅: {price_change * 100:.2f}%）")
+        print(f"   ✅ 是否达到手续费保护门槛:            {current_price >= buy_price * (1 + min_profit) if buy_price else False}（当前价: {current_price}，门槛价: {buy_price * (1 + min_profit) if buy_price else 'N/A'}）")
+        
         # 卖出逻辑：价格上涨超阈值 + 有持仓 + 超过手续费
         if (
             btc_amount > 0 and
@@ -75,3 +94,4 @@ while True:
     except Exception as e:
         print(f'❌ 发生错误: {e}')
         time.sleep(10)
+
