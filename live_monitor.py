@@ -456,6 +456,8 @@ class LiveMonitor:
             if self.check_k1_qualification(prev_kline):
                 self.k1_15m = prev_kline
                 self.current_k_number = 1
+                # 标记已进入监听周期（用于触发1m检查）
+                self.last_15m_kline = self.k1_15m
                 
                 # 清空状态
                 self.alerted_signals.clear()
@@ -475,6 +477,10 @@ class LiveMonitor:
                 
                 return True
             else:
+                # 调试信息：打印未满足K1条件的原因
+                actual = prev_kline.get_body_range() * 100
+                need = self.min_k1_range * 100
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] K1未达标: 实际{actual:.3f}% < 阈值{need:.3f}%", end='\r')
                 return False
         
         # === 第2条15m K线：检查是否为内包 ===

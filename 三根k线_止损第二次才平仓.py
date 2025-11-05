@@ -23,6 +23,11 @@
   - 第一次触及止损点时，不平仓，继续持仓
   - 第二次触及止损点时，才执行止损平仓
   - 这样可以避免短期波动造成的过早止损
+
+亏损回撤平仓规则:
+  - 持仓超过指定K线数后（默认10根），开始检查亏损回撤
+  - 如果曾经亏损超过阈值，现在亏损回到阈值内，则平仓
+  - 目的：在亏损减轻时及时止损，避免再次扩大
 """
 
 import urllib.request
@@ -181,7 +186,9 @@ class ThreeKlineStrategy:
                     min_k1_range: float = 0.005,
                     max_holding_bars_tp: int = None,
                     max_holding_bars_sl: int = None,
-                    allow_stop_loss_retry: bool = True) -> List[Dict]:
+                    allow_stop_loss_retry: bool = True,
+                    loss_recover_bars: int = 10,
+                    loss_recover_threshold: float = 0.004) -> List[Dict]:
         """
         查找所有交易信号并模拟持仓直到触发止盈/止损
         
@@ -193,6 +200,8 @@ class ThreeKlineStrategy:
             max_holding_bars_tp: 止盈超时阈值(根K线数)，超过此时间未止盈则平仓
             max_holding_bars_sl: 止损超时阈值(根K线数)，超过此时间未止损则平仓
             allow_stop_loss_retry: 是否允许第一次触及止损点时不平仓，第二次才止损
+            loss_recover_bars: 持仓多少根K线后开始检查亏损回撤
+            loss_recover_threshold: 亏损回到多少%时平仓 (现货价格变动)
         
         返回:
             信号列表(仅包含已触发止盈/止损的交易)
@@ -254,6 +263,7 @@ class ThreeKlineStrategy:
                 entry_price = signal['entry_price']
                 direction = signal['direction']
                 stop_loss_hit_count = 0  # 止损触发次数计数器
+                max_loss_seen = 0.0  # 记录持仓期间的最大亏损
                 
                 # 从入场后的第一根K线开始监测
                 for j in range(entry_index, len(klines)):
@@ -269,6 +279,10 @@ class ThreeKlineStrategy:
                         high_return = (entry_price - current_kline.low) / entry_price
                         low_return = (entry_price - current_kline.high) / entry_price
                         current_return = (entry_price - current_kline.close) / entry_price
+                    
+                    # 更新最大亏损
+                    if low_return < 0:
+                        max_loss_seen = max(max_loss_seen, abs(low_return))
                     
                     # 检查是否触发止盈
                     if high_return >= profit_target:
@@ -296,6 +310,23 @@ class ThreeKlineStrategy:
                         signal['holding_bars'] = holding_bars
                         signal['return'] = -stop_loss
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
+                        signals.append(signal)
+                        in_position = False
+                        break
+                    # 检查亏损回撤平仓（持仓超过指定K线数后，如果亏损回到阈值则平仓）
+                    elif (holding_bars > loss_recover_bars and 
+                          current_return < 0 and 
+                          abs(current_return) <= loss_recover_threshold and
+                          max_loss_seen > loss_recover_threshold):
+                        # 曾经亏损超过阈值，现在回到阈值内，平仓
+                        signal['exit_type'] = 'loss_recover'
+                        signal['exit_price'] = current_kline.close
+                        signal['exit_time'] = current_kline.timestamp
+                        signal['exit_index'] = j
+                        signal['holding_bars'] = holding_bars
+                        signal['return'] = current_return
+                        signal['stop_loss_hit_count'] = stop_loss_hit_count
+                        signal['max_loss_seen'] = max_loss_seen
                         signals.append(signal)
                         in_position = False
                         break
@@ -397,6 +428,10 @@ class ThreeKlineStrategy:
                 losses += 1
                 losses_list.append(return_pct)
                 result = '止损'
+            elif exit_type == 'loss_recover':
+                losses += 1
+                losses_list.append(return_pct)
+                result = '亏损回撤平仓'
             else:  # timeout_loss
                 losses += 1
                 losses_list.append(return_pct)
@@ -594,15 +629,20 @@ def main():
     """主函数"""
     # ====== 关键参数集中设置 ======
     leverage = 50               # 杠杆倍数
-    profit_target_percent = 60  # 止盈百分比（合约收益%）
+    profit_target_percent = 40  # 止盈百分比（合约收益%）
     stop_loss_percent = 74     # 止损百分比（合约亏损%）
     initial_capital = 1.0       # 每次投入资金（USDT）
     min_k1_range_percent = 0.41  # 第一根K线开收涨跌幅要求（%）
+    
+    # 亏损回撤平仓参数
+    loss_recover_bars = 10      # 持仓多少根K线后开始检查亏损回撤
+    loss_recover_threshold = 20 # 亏损回到多少%时平仓（合约亏损%）
     # ==============================
     
     # 计算现货价格需要变动的百分比
     price_profit_target = profit_target_percent / leverage / 100
     price_stop_loss = stop_loss_percent / leverage / 100
+    price_loss_recover = loss_recover_threshold / leverage / 100
     min_k1_range = min_k1_range_percent / 100
     
     print("="*80)
@@ -667,7 +707,9 @@ def main():
     signals = strategy.find_signals(klines, 
                                     profit_target=price_profit_target,
                                     stop_loss=price_stop_loss,
-                                    min_k1_range=min_k1_range)
+                                    min_k1_range=min_k1_range,
+                                    loss_recover_bars=loss_recover_bars,
+                                    loss_recover_threshold=price_loss_recover)
     print(f"找到 {len(signals)} 个已平仓交易 (触发止盈/止损)")
     
     # 打印信号详情
@@ -691,6 +733,7 @@ def main():
     print(f"止盈设置: {profit_target_percent}% (价格变动 {price_profit_target*100:.2f}%)")
     print(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss*100:.2f}%)")
     print(f"K1涨跌幅要求: {min_k1_range_percent}%")
+    print(f"亏损回撤平仓: 持仓>{loss_recover_bars}根K线后，亏损回到{loss_recover_threshold}% (价格变动{price_loss_recover*100:.2f}%)时平仓")
     print(f"每次投入: {initial_capital} USDT")
     print(f"{'-'*80}")
     print(f"总交易数: {stats['total_trades']} (仅统计已触发止盈/止损的交易)")
