@@ -172,7 +172,8 @@ class ThreeKlineStrategy:
     
     def find_signals(self, klines: List[KLine], 
                     profit_target: float = 0.008, 
-                    stop_loss: float = 0.004) -> List[Dict]:
+                    stop_loss: float = 0.004,
+                    min_k1_range: float = 0.005) -> List[Dict]:
         """
         查找所有交易信号并模拟持仓直到触发止盈/止损
         
@@ -180,6 +181,7 @@ class ThreeKlineStrategy:
             klines: K线列表
             profit_target: 止盈百分比 (现货价格变动)
             stop_loss: 止损百分比 (现货价格变动)
+            min_k1_range: K1最小涨跌幅要求 (小数形式，如0.005表示0.5%)
         
         返回:
             信号列表(仅包含已触发止盈/止损的交易)
@@ -204,7 +206,7 @@ class ThreeKlineStrategy:
             if i < len(klines) - 2 and self.is_contained(k1, k2):
                 k3 = klines[i + 2]
                 # k3执行法则1的规则(相对于k1)
-                is_valid, direction = self.check_rule1(k1, k3)
+                is_valid, direction = self.check_rule1(k1, k3, min_k1_range)
                 if is_valid:
                     signal = {
                         'type': 'rule2',
@@ -221,7 +223,7 @@ class ThreeKlineStrategy:
                     i += 2  # 跳到入场K线位置
             # 检查法则1: k2相对于k1
             else:
-                is_valid, direction = self.check_rule1(k1, k2)
+                is_valid, direction = self.check_rule1(k1, k2, min_k1_range)
                 if is_valid:
                     signal = {
                         'type': 'rule1',
@@ -451,6 +453,14 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
         return
     
     try:
+        # 从stats中获取动态参数
+        leverage = stats.get('leverage', 30)
+        profit_target_percent = stats.get('profit_target_percent', 40)
+        stop_loss_percent = stats.get('stop_loss_percent', 20)
+        min_k1_range_percent = stats.get('min_k1_range_percent', 0.5)
+        price_profit_target = profit_target_percent / leverage
+        price_stop_loss = stop_loss_percent / leverage
+        
         with open(filename, 'w', encoding='utf-8') as f:
             f.write("="*80 + "\n")
             f.write("三K线策略交易日志\n")
@@ -458,9 +468,10 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
             f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"交易对: BTCUSDT\n")
             f.write(f"K线周期: 15分钟\n")
-            f.write(f"交易模式: 合约 (50倍杠杆)\n")
-            f.write(f"止盈设置: 40% (价格变动 0.80%)\n")
-            f.write(f"止损设置: 20% (价格变动 0.40%)\n")
+            f.write(f"交易模式: 合约 ({leverage}倍杠杆)\n")
+            f.write(f"止盈设置: {profit_target_percent}% (价格变动 {price_profit_target:.2f}%)\n")
+            f.write(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss:.2f}%)\n")
+            f.write(f"K1涨跌幅要求: {min_k1_range_percent}%\n")
             f.write("="*80 + "\n\n")
             
             f.write("策略统计摘要:\n")
@@ -470,8 +481,8 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
             f.write(f"盈利次数: {stats['wins']}\n")
             f.write(f"亏损次数: {stats['losses']}\n")
             f.write(f"胜率: {stats['win_rate']:.2f}%\n")
-            f.write(f"平均盈利: {stats['avg_profit']*50:.2f}% (合约收益)\n")
-            f.write(f"平均亏损: {stats['avg_loss']*50:.2f}% (合约亏损)\n")
+            f.write(f"平均盈利: {stats['avg_profit']*leverage:.2f}% (合约收益)\n")
+            f.write(f"平均亏损: {stats['avg_loss']*leverage:.2f}% (合约亏损)\n")
             f.write(f"平均持仓: {stats['avg_holding_bars']:.1f}根K线 ({stats['avg_holding_time']})\n")
             f.write(f"盈亏比: {stats['profit_factor']:.2f}\n")
             f.write("-"*80 + "\n")
@@ -527,12 +538,25 @@ def print_signal_details(signals: List[Dict], limit: int = 10):
 
 def main():
     """主函数"""
+    # ====== 关键参数集中设置 ======
+    leverage = 50               # 杠杆倍数
+    profit_target_percent = 30  # 止盈百分比（合约收益%）
+    stop_loss_percent = 99      # 止损百分比（合约亏损%）
+    initial_capital = 1.0       # 每次投入资金（USDT）
+    min_k1_range_percent = 0.21  # 第一根K线开收涨跌幅要求（%）
+    # ==============================
+    
+    # 计算现货价格需要变动的百分比
+    price_profit_target = profit_target_percent / leverage / 100
+    price_stop_loss = stop_loss_percent / leverage / 100
+    min_k1_range = min_k1_range_percent / 100
+    
     print("="*80)
     print("三K线策略胜率统计系统")
     print("="*80)
     print(f"交易对: BTCUSDT")
     print(f"K线周期: 15分钟")
-    print(f"交易模式: 合约 (50倍杠杆)")
+    print(f"交易模式: 合约 ({leverage}倍杠杆)")
     print(f"数据来源: 币安API")
     print("="*80)
     
@@ -586,18 +610,10 @@ def main():
     # 查找信号
     print("\n正在分析K线形态并模拟交易...")
     
-    # 计算止盈止损参数
-    leverage = 50
-    profit_target_percent = 60  # 止盈40%
-    stop_loss_percent = 50  # 止损20%
-    
-    # 计算现货价格需要变动的百分比
-    price_profit_target = profit_target_percent / leverage / 100  # 0.8%
-    price_stop_loss = stop_loss_percent / leverage / 100  # 0.4%
-    
     signals = strategy.find_signals(klines, 
                                     profit_target=price_profit_target,
-                                    stop_loss=price_stop_loss)
+                                    stop_loss=price_stop_loss,
+                                    min_k1_range=min_k1_range)
     print(f"找到 {len(signals)} 个已平仓交易 (触发止盈/止损)")
     
     # 打印信号详情
@@ -605,16 +621,23 @@ def main():
     
     # 计算胜率
     print("\n正在计算统计数据...")
-    initial_capital = 1.0  # 每次投入1 USDT
     stats = strategy.calculate_win_rate(signals, leverage=leverage, initial_capital=initial_capital)
+    
+    # 附加关键参数到stats，便于导出txt时动态展示
+    stats['leverage'] = leverage
+    stats['profit_target_percent'] = profit_target_percent
+    stats['stop_loss_percent'] = stop_loss_percent
+    stats['min_k1_range_percent'] = min_k1_range_percent
     
     # 打印统计结果
     print(f"\n{'='*80}")
     print("策略统计结果")
     print(f"{'='*80}")
-    print(f"交易模式: 合约交易 (50倍杠杆)")
-    print(f"止盈设置: 40% (价格变动 0.80%)")
-    print(f"止损设置: 20% (价格变动 0.40%)")
+    print(f"交易模式: 合约交易 ({leverage}倍杠杆)")
+    print(f"止盈设置: {profit_target_percent}% (价格变动 {price_profit_target*100:.2f}%)")
+    print(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss*100:.2f}%)")
+    print(f"K1涨跌幅要求: {min_k1_range_percent}%")
+    print(f"每次投入: {initial_capital} USDT")
     print(f"{'-'*80}")
     print(f"总交易数: {stats['total_trades']} (仅统计已触发止盈/止损的交易)")
     print(f"盈利次数: {stats['wins']} (止盈)")
@@ -650,7 +673,7 @@ def main():
     
     print("\n注意事项:")
     print("- 本统计仅供参考，实际交易需考虑手续费、滑点、资金费率等因素")
-    print("- 合约交易风险极高，50倍杠杆下价格波动0.4%即触发止损")
+    print(f"- 合约交易风险极高，{leverage}倍杠杆下价格波动{price_stop_loss*100:.2f}%即触发止损")
     print("- 建议严格执行止损，控制仓位，避免爆仓风险")
     
     # 导出日志
