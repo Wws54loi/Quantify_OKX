@@ -173,7 +173,10 @@ class ThreeKlineStrategy:
     def find_signals(self, klines: List[KLine], 
                     profit_target: float = 0.008, 
                     stop_loss: float = 0.004,
-                    min_k1_range: float = 0.005) -> List[Dict]:
+                    min_k1_range: float = 0.005,
+                    max_holding_bars_tp: int = None,
+                    max_holding_bars_sl: int = None,
+                    allow_stop_loss_retry: bool = True) -> List[Dict]:
         """
         查找所有交易信号并模拟持仓直到触发止盈/止损
         
@@ -182,6 +185,9 @@ class ThreeKlineStrategy:
             profit_target: 止盈百分比 (现货价格变动)
             stop_loss: 止损百分比 (现货价格变动)
             min_k1_range: K1最小涨跌幅要求 (小数形式，如0.005表示0.5%)
+            max_holding_bars_tp: 止盈超时阈值(根K线数)，超过此时间未止盈则平仓
+            max_holding_bars_sl: 止损超时阈值(根K线数)，超过此时间未止损则平仓
+            allow_stop_loss_retry: 是否允许第一次触及止损点时不平仓，第二次才止损
         
         返回:
             信号列表(仅包含已触发止盈/止损的交易)
@@ -242,18 +248,22 @@ class ThreeKlineStrategy:
             if signal and entry_index:
                 entry_price = signal['entry_price']
                 direction = signal['direction']
+                stop_loss_hit_count = 0  # 止损触发次数计数器
                 
                 # 从入场后的第一根K线开始监测
                 for j in range(entry_index, len(klines)):
                     current_kline = klines[j]
+                    holding_bars = j - entry_index + 1
                     
                     # 计算收益率
                     if direction == 'long':
                         high_return = (current_kline.high - entry_price) / entry_price
                         low_return = (current_kline.low - entry_price) / entry_price
+                        current_return = (current_kline.close - entry_price) / entry_price
                     else:  # short
                         high_return = (entry_price - current_kline.low) / entry_price
                         low_return = (entry_price - current_kline.high) / entry_price
+                        current_return = (entry_price - current_kline.close) / entry_price
                     
                     # 检查是否触发止盈
                     if high_return >= profit_target:
@@ -261,19 +271,50 @@ class ThreeKlineStrategy:
                         signal['exit_price'] = entry_price * (1 + profit_target) if direction == 'long' else entry_price * (1 - profit_target)
                         signal['exit_time'] = current_kline.timestamp
                         signal['exit_index'] = j
-                        signal['holding_bars'] = j - entry_index + 1
+                        signal['holding_bars'] = holding_bars
                         signal['return'] = profit_target
+                        signal['stop_loss_hit_count'] = stop_loss_hit_count
                         signals.append(signal)
                         in_position = False
                         break
                     # 检查是否触发止损
                     elif low_return <= -stop_loss:
+                        stop_loss_hit_count += 1
+                        # 如果允许重试且是第一次触及止损，继续持仓
+                        if allow_stop_loss_retry and stop_loss_hit_count == 1:
+                            continue
+                        # 第二次触及止损或不允许重试，则平仓
                         signal['exit_type'] = 'stop_loss'
                         signal['exit_price'] = entry_price * (1 - stop_loss) if direction == 'long' else entry_price * (1 + stop_loss)
                         signal['exit_time'] = current_kline.timestamp
                         signal['exit_index'] = j
-                        signal['holding_bars'] = j - entry_index + 1
+                        signal['holding_bars'] = holding_bars
                         signal['return'] = -stop_loss
+                        signal['stop_loss_hit_count'] = stop_loss_hit_count
+                        signals.append(signal)
+                        in_position = False
+                        break
+                    # 检查止盈超时（如果设置了）
+                    elif max_holding_bars_tp is not None and holding_bars > max_holding_bars_tp and current_return > 0:
+                        signal['exit_type'] = 'timeout_profit'
+                        signal['exit_price'] = current_kline.close
+                        signal['exit_time'] = current_kline.timestamp
+                        signal['exit_index'] = j
+                        signal['holding_bars'] = holding_bars
+                        signal['return'] = current_return
+                        signal['stop_loss_hit_count'] = stop_loss_hit_count
+                        signals.append(signal)
+                        in_position = False
+                        break
+                    # 检查止损超时（如果设置了）
+                    elif max_holding_bars_sl is not None and holding_bars > max_holding_bars_sl and current_return <= 0:
+                        signal['exit_type'] = 'timeout_loss'
+                        signal['exit_price'] = current_kline.close
+                        signal['exit_time'] = current_kline.timestamp
+                        signal['exit_index'] = j
+                        signal['holding_bars'] = holding_bars
+                        signal['return'] = current_return
+                        signal['stop_loss_hit_count'] = stop_loss_hit_count
                         signals.append(signal)
                         in_position = False
                         break
@@ -343,10 +384,18 @@ class ThreeKlineStrategy:
                 wins += 1
                 profits.append(return_pct)
                 result = '止盈'
-            else:  # stop_loss
+            elif exit_type == 'timeout_profit':
+                wins += 1
+                profits.append(return_pct)
+                result = '超时止盈'
+            elif exit_type == 'stop_loss':
                 losses += 1
                 losses_list.append(return_pct)
                 result = '止损'
+            else:  # timeout_loss
+                losses += 1
+                losses_list.append(return_pct)
+                result = '超时止损'
             
             # 计算百分比
             price_change_percent = return_pct * 100
@@ -540,10 +589,10 @@ def main():
     """主函数"""
     # ====== 关键参数集中设置 ======
     leverage = 50               # 杠杆倍数
-    profit_target_percent = 30  # 止盈百分比（合约收益%）
+    profit_target_percent = 40  # 止盈百分比（合约收益%）
     stop_loss_percent = 99      # 止损百分比（合约亏损%）
     initial_capital = 1.0       # 每次投入资金（USDT）
-    min_k1_range_percent = 0.21  # 第一根K线开收涨跌幅要求（%）
+    min_k1_range_percent = 0.44  # 第一根K线开收涨跌幅要求（%）
     # ==============================
     
     # 计算现货价格需要变动的百分比
