@@ -144,113 +144,102 @@ class SimpleKLine:
 
 class LiveMonitor:
     """实时监听器"""
+    
     def __init__(self, min_k1_range_percent: float = 0.21, serverchan_sendkey: str = None):
-        # 基本参数
         self.min_k1_range = min_k1_range_percent / 100  # 转换为小数
-        self.api = BinanceLiveAPI()
-
-        # 15m状态
         self.last_15m_kline = None  # 上一根完整的15分钟K线
         self.current_15m_start_time = 0  # 当前15分钟K线的开始时间
-
-        # 信号去重/记录
         self.alerted_signals = set()  # 已通知的信号(避免重复通知)
-
+        self.api = BinanceLiveAPI()
+        
         # 突破状态记录
         self.breakout_high = False  # 是否已突破最高点
         self.breakout_low = False   # 是否已突破最低点
         self.breakout_high_price = 0.0  # 突破最高点的价格
         self.breakout_low_price = 0.0   # 突破最低点的价格
-
-        # 延迟弹窗
+        
+        # 信号记录(用于延迟弹窗通知)
         self.pending_signal = None  # 待通知的信号
         self.popup_notified = False  # 本周期是否已弹窗通知
-
+        
         # 微信通知配置
         self.serverchan_sendkey = serverchan_sendkey
-
+        
         # 网络状态统计
         self.request_count = 0  # 总请求次数
         self.failed_count = 0   # 失败次数
         self.last_success_time = time.time()  # 上次成功请求时间
-
-        # 15m K线内包形态状态
-        self.k1_15m = None  # 第1条15m K线（满足百分比的那条）
-        self.k2_15m = None  # 第2条15m K线
-        self.k2_is_inside = False  # 第2条是否为内包
-        self.monitoring_k3 = False  # 是否正在监听第3条15m
-        self.current_k_number = 0  # 当前是第几条15m K线（1=K1, 2=K2, 3=K3）
         
     def check_k1_qualification(self, k1: SimpleKLine) -> bool:
         """检查K1是否符合涨跌幅要求"""
         body_range = k1.get_body_range()
         return body_range >= self.min_k1_range
     
-    def check_signal(self, ref_15m: SimpleKLine, current_1m: SimpleKLine) -> Optional[Dict]:
+    def check_signal(self, k1_15m: SimpleKLine, k1_1m: SimpleKLine) -> Optional[Dict]:
         """
         检查1分钟K线是否满足信号条件
         
         逻辑:
-        1. 先检测是否有1分钟K线突破过参考15分钟K线的最高/最低点(记录状态)
+        1. 先检测是否有1分钟K线突破过15分钟K线的最高/最低点(记录状态)
         2. 后续1分钟K线收盘价回到区间内时,触发信号
         
         参数:
-            ref_15m: 参考的15分钟K线（可能是K1或K2，取决于是否有内包）
-            current_1m: 当前1分钟K线
+            k1_15m: 前一根15分钟K线(已完成)
+            k1_1m: 当前1分钟K线
         
         返回:
             如果满足条件返回信号字典,否则返回None
         """
         # 检测是否突破最高点
-        if current_1m.high > ref_15m.high:
+        if k1_1m.high > k1_15m.high:
             if not self.breakout_high:
                 self.breakout_high = True
-                self.breakout_high_price = current_1m.high
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ⬆️ 检测到向上突破! 突破价:{current_1m.high:.2f} > 参考最高:{ref_15m.high:.2f}")
-                print(f"    等待收盘价回到区间内 [{ref_15m.low:.2f} - {ref_15m.high:.2f}] 以触发做空信号...")
+                self.breakout_high_price = k1_1m.high
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ⬆️ 检测到向上突破! 突破价:{k1_1m.high:.2f} > 参考最高:{k1_15m.high:.2f}")
+                print(f"    等待收盘价回到区间内 [{k1_15m.low:.2f} - {k1_15m.high:.2f}] 以触发做空信号...")
         
         # 检测是否突破最低点
-        if current_1m.low < ref_15m.low:
+        if k1_1m.low < k1_15m.low:
             if not self.breakout_low:
                 self.breakout_low = True
-                self.breakout_low_price = current_1m.low
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ⬇️ 检测到向下突破! 突破价:{current_1m.low:.2f} < 参考最低:{ref_15m.low:.2f}")
-                print(f"    等待收盘价回到区间内 [{ref_15m.low:.2f} - {ref_15m.high:.2f}] 以触发做多信号...")
+                self.breakout_low_price = k1_1m.low
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ⬇️ 检测到向下突破! 突破价:{k1_1m.low:.2f} < 参考最低:{k1_15m.low:.2f}")
+                print(f"    等待收盘价回到区间内 [{k1_15m.low:.2f} - {k1_15m.high:.2f}] 以触发做多信号...")
         
         # 检查收盘价是否回到区间内
-        close_in_range = ref_15m.low <= current_1m.close <= ref_15m.high
+        close_in_range = k1_15m.low <= k1_1m.close <= k1_15m.high
         
         if not close_in_range:
             return None
         
         # 如果之前向上突破过,现在收盘价回到区间 -> 做空信号
         if self.breakout_high:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ✅ 收盘价已回到区间内! 当前价:{current_1m.close:.2f} 在 [{ref_15m.low:.2f} - {ref_15m.high:.2f}]")
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ✅ 收盘价已回到区间内! 当前价:{k1_1m.close:.2f} 在 [{k1_15m.low:.2f} - {k1_15m.high:.2f}]")
             return {
                 'type': 'short',
                 'direction': '做空',
-                'k15m': ref_15m,
-                'k1m': current_1m,
+                'k15m': k1_15m,
+                'k1m': k1_1m,
                 'breakout_type': '向上突破后回落',
                 'breakout_price': self.breakout_high_price,
-                'reference_price': ref_15m.high,
-                'current_price': current_1m.close,
-                'timestamp': current_1m.timestamp
+                'reference_price': k1_15m.high,
+                'current_price': k1_1m.close,
+                'timestamp': k1_1m.timestamp
             }
         
         # 如果之前向下突破过,现在收盘价回到区间 -> 做多信号
         if self.breakout_low:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ✅ 收盘价已回到区间内! 当前价:{current_1m.close:.2f} 在 [{ref_15m.low:.2f} - {ref_15m.high:.2f}]")
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ✅ 收盘价已回到区间内! 当前价:{k1_1m.close:.2f} 在 [{k1_15m.low:.2f} - {k1_15m.high:.2f}]")
             return {
                 'type': 'long',
                 'direction': '做多',
-                'k15m': ref_15m,
-                'k1m': current_1m,
+                'k15m': k1_15m,
+                'k1m': k1_1m,
                 'breakout_type': '向下突破后回升',
                 'breakout_price': self.breakout_low_price,
-                'reference_price': ref_15m.low,
-                'current_price': current_1m.close,
-                'timestamp': current_1m.timestamp
+                'reference_price': k1_15m.low,
+                'current_price': k1_1m.close,
+                'timestamp': k1_1m.timestamp
             }
         
         return None
@@ -320,23 +309,6 @@ class LiveMonitor:
                     
         except Exception as e:
             print(f"✗ 微信通知发送异常: {e}")
-            return False
-
-    def send_wechat_text(self, title: str, content: str) -> bool:
-        """发送自定义文本到微信(通过Server酱)"""
-        if not self.serverchan_sendkey:
-            return False
-        try:
-            url = f"https://sctapi.ftqq.com/{self.serverchan_sendkey}.send"
-            data = {'title': title, 'desp': content}
-            import urllib.parse
-            post_data = urllib.parse.urlencode(data).encode('utf-8')
-            req = urllib.request.Request(url, data=post_data, method='POST')
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read().decode('utf-8'))
-                return result.get('code') == 0
-        except Exception as e:
-            print(f"微信文本通知异常: {e}")
             return False
     
     def send_notification(self, signal: Dict, show_popup: bool = False):
@@ -428,38 +400,26 @@ class LiveMonitor:
             pass
     
     def update_15m_kline(self):
-        """
-        更新15分钟K线数据
-        
-        逻辑：
-        1. 第1条15m K线满足百分比 → 保存为K1，开始监听
-        2. 第2条15m K线完成时：
-           - 检查是否为内包（K2完全在K1范围内）
-           - 如果是内包 → 标记，继续等待K3
-           - 如果不是内包 → 用K2与K1比较，在K2期间发信号
-        3. 第3条15m K线（仅当K2是内包时）：
-           - 用K3与K1比较，在K3期间发信号
-        """
-        klines_15m = self.api.get_latest_klines(symbol="BTCUSDT", interval="15m", limit=3)
+        """更新15分钟K线数据"""
+        klines_15m = self.api.get_latest_klines(symbol="BTCUSDT", interval="15m", limit=2)
         if len(klines_15m) < 2:
             if len(klines_15m) == 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ 获取15分钟K线失败，跳过本次检查", end='\r')
             return False
         
-        # 获取最近完成的15m K线（倒数第二根）
-        prev_kline = SimpleKLine(klines_15m[-2])
-        current_kline_data = klines_15m[-1]
-        self.current_15m_start_time = current_kline_data[0]
+        # 倒数第二根是已完成的K线
+        prev_kline_data = klines_15m[-2]
+        prev_kline = SimpleKLine(prev_kline_data)
         
-        # === 第1条15m K线：检查百分比，开始监听 ===
-        if self.k1_15m is None:
+        # 如果是新的15分钟K线周期
+        if self.last_15m_kline is None or prev_kline.timestamp != self.last_15m_kline.timestamp:
+            # 检查是否符合涨跌幅要求
             if self.check_k1_qualification(prev_kline):
-                self.k1_15m = prev_kline
-                self.current_k_number = 1
-                # 标记已进入监听周期（用于触发1m检查）
-                self.last_15m_kline = self.k1_15m
+                self.last_15m_kline = prev_kline
+                current_kline_data = klines_15m[-1]
+                self.current_15m_start_time = current_kline_data[0]
                 
-                # 清空状态
+                # 新周期开始,清空已通知信号和突破状态
                 self.alerted_signals.clear()
                 self.breakout_high = False
                 self.breakout_low = False
@@ -468,35 +428,15 @@ class LiveMonitor:
                 self.pending_signal = None
                 self.popup_notified = False
                 
-                print(f"\n{'='*80}")
-                print(f"✓ [{datetime.now().strftime('%H:%M:%S')}] 第1条15m K线符合条件!")
-                print(f"  涨跌幅: {prev_kline.get_body_range()*100:.3f}%")
-                print(f"  区间: [{prev_kline.low:.2f} - {prev_kline.high:.2f}]")
-                print(f"  等待第2条15m K线...")
-                print(f"{'='*80}")
+                print(f"\n✓ [{datetime.now().strftime('%H:%M:%S')}] 15分钟K线符合条件! 涨跌幅:{prev_kline.get_body_range()*100:.3f}% 开始监听1分钟K线")
                 
                 return True
             else:
-                # 调试信息：打印未满足K1条件的原因
-                actual = prev_kline.get_body_range() * 100
-                need = self.min_k1_range * 100
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] K1未达标: 实际{actual:.3f}% < 阈值{need:.3f}%", end='\r')
-                return False
-        
-        # === 第2条15m K线：检查是否为内包 ===
-        elif self.current_k_number == 1 and prev_kline.timestamp != self.k1_15m.timestamp:
-            self.k2_15m = prev_kline
-            self.current_k_number = 2
-            
-            # 检查K2是否为内包（K2的高低完全在K1范围内）
-            self.k2_is_inside = (self.k2_15m.high <= self.k1_15m.high and 
-                                self.k2_15m.low >= self.k1_15m.low)
-            
-            if self.k2_is_inside:
-                # K2是内包 → 继续等待K3，用K3与K1比较
-                self.monitoring_k3 = True
-                
-                # 清空突破状态，准备监听K3
+                # 不符合条件，清除监听
+                if self.last_15m_kline is not None:
+                    print(f"\n✗ [{datetime.now().strftime('%H:%M:%S')}] 15分钟K线涨跌幅不足,停止监听")
+                self.last_15m_kline = None
+                self.current_15m_start_time = 0
                 self.alerted_signals.clear()
                 self.breakout_high = False
                 self.breakout_low = False
@@ -504,133 +444,14 @@ class LiveMonitor:
                 self.breakout_low_price = 0.0
                 self.pending_signal = None
                 self.popup_notified = False
-                
-                print(f"\n{'='*80}")
-                print(f"🔔 [{datetime.now().strftime('%H:%M:%S')}] 第2条15m K线为内包!")
-                print(f"  K1区间: [{self.k1_15m.low:.2f} - {self.k1_15m.high:.2f}]")
-                print(f"  K2区间: [{self.k2_15m.low:.2f} - {self.k2_15m.high:.2f}]")
-                print(f"  将用第3条15m K线与第1条比较")
-                print(f"{'='*80}")
-                
-                # 微信通知内包形态
-                ts = datetime.fromtimestamp(self.k2_15m.timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
-                content = (
-                    f"## 15分钟内包形态\n\n"
-                    f"**时间:** {ts}\n\n"
-                    f"**K1区间:** [{self.k1_15m.low:.2f} - {self.k1_15m.high:.2f}]\n\n"
-                    f"**K2区间:** [{self.k2_15m.low:.2f} - {self.k2_15m.high:.2f}]\n\n"
-                    f"> 第2条15m K线完全被第1条包含\n\n"
-                    f"> 将等待第3条15m K线，用K3与K1比较"
-                )
-                self.send_wechat_text("BTC 15m内包形态", content)
-                
-            else:
-                # K2不是内包 → 直接用K2与K1比较，在K2期间发信号
-                print(f"\n{'='*80}")
-                print(f"✓ [{datetime.now().strftime('%H:%M:%S')}] 第2条15m K线不是内包")
-                print(f"  K1区间: [{self.k1_15m.low:.2f} - {self.k1_15m.high:.2f}]")
-                print(f"  K2区间: [{self.k2_15m.low:.2f} - {self.k2_15m.high:.2f}]")
-                print(f"  开始监听K2期间的1m K线（用K2与K1比较）")
-                print(f"{'='*80}")
-                
-                # 清空突破状态，准备监听K2期间
-                self.alerted_signals.clear()
-                self.breakout_high = False
-                self.breakout_low = False
-                self.breakout_high_price = 0.0
-                self.breakout_low_price = 0.0
-                self.pending_signal = None
-                self.popup_notified = False
-            
-            return True
-        
-        # === 第3条15m K线：仅当K2是内包时才处理 ===
-        elif self.current_k_number == 2 and self.monitoring_k3 and prev_kline.timestamp != self.k2_15m.timestamp:
-            k3_15m = prev_kline
-            self.current_k_number = 3
-            
-            print(f"\n{'='*80}")
-            print(f"✓ [{datetime.now().strftime('%H:%M:%S')}] 第3条15m K线开始")
-            print(f"  K1区间: [{self.k1_15m.low:.2f} - {self.k1_15m.high:.2f}]")
-            print(f"  K3区间: [{k3_15m.low:.2f} - {k3_15m.high:.2f}]")
-            print(f"  开始监听K3期间的1m K线（用K3与K1比较）")
-            print(f"{'='*80}")
-            
-            # 清空突破状态，准备监听K3期间
-            self.alerted_signals.clear()
-            self.breakout_high = False
-            self.breakout_low = False
-            self.breakout_high_price = 0.0
-            self.breakout_low_price = 0.0
-            self.pending_signal = None
-            self.popup_notified = False
-            
-            return True
-        
-        # === K3结束后，重置所有状态，等待新的K1 ===
-        elif self.current_k_number == 3 and prev_kline.timestamp != self.current_15m_start_time:
-            print(f"\n{'='*80}")
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 监听周期结束，等待新的K1...")
-            print(f"{'='*80}")
-            
-            # 重置所有状态
-            self.k1_15m = None
-            self.k2_15m = None
-            self.k2_is_inside = False
-            self.monitoring_k3 = False
-            self.current_k_number = 0
-            self.last_15m_kline = None
-            
-            self.alerted_signals.clear()
-            self.breakout_high = False
-            self.breakout_low = False
-            self.breakout_high_price = 0.0
-            self.breakout_low_price = 0.0
-            self.pending_signal = None
-            self.popup_notified = False
-            
-            return False
         
         return False
     
     def check_1m_klines(self):
-        """
-        检查1分钟K线
-        
-        逻辑：
-        - K1期间：不监听（等待K2）
-        - K2期间且K2不是内包：监听，用K1作为参考
-        - K2期间且K2是内包：不监听（等待K3）
-        - K3期间（K2是内包）：监听，用K1作为参考
-        - 提醒时机：在监听期间的第13根1m K线时提醒
-        """
-        # 判断当前应该监听哪个阶段
-        if self.current_k_number == 0:
-            # 还没有K1，等待中
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 等待符合条件的15分钟K线...", end='\r')
+        """检查1分钟K线"""
+        if self.last_15m_kline is None:
             return
-        elif self.current_k_number == 1:
-            # K1期间不监听（等待K2）
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] K1期间，等待K2完成...", end='\r')
-            return
-        elif self.current_k_number == 2 and self.k2_is_inside:
-            # K2是内包，不监听K2期间（等待K3）
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] K2为内包，等待K3完成...", end='\r')
-            return
-        
-        # === 确定参考K线和监听阶段 ===
-        if self.current_k_number == 2 and not self.k2_is_inside:
-            # K2不是内包 → 监听K2期间，用K1作为参考
-            ref_15m = self.k1_15m
-            monitoring_stage = "K2"
-        elif self.current_k_number == 3:
-            # K2是内包，K3 → 监听K3期间，用K1作为参考
-            ref_15m = self.k1_15m
-            monitoring_stage = "K3"
-        else:
-            # 其他情况不监听
-            return
-        
+
         # 获取最新的1分钟K线
         klines_1m = self.api.get_latest_klines(symbol="BTCUSDT", interval="1m", limit=1)
         if not klines_1m:
@@ -638,7 +459,6 @@ class LiveMonitor:
             return
 
         k1m = SimpleKLine(klines_1m[0])
-
 
         # 计算当前1分钟K线在15分钟周期中的位置
         # 15分钟 = 15根1分钟K线
@@ -662,8 +482,8 @@ class LiveMonitor:
         if k1m.timestamp < self.current_15m_start_time:
             return
 
-        # 检查是否满足信号条件（使用ref_15m即K1作为参考）
-        signal = self.check_signal(ref_15m, k1m)
+        # 检查是否满足信号条件
+        signal = self.check_signal(self.last_15m_kline, k1m)
 
         if signal:
             # 生成唯一标识，避免重复通知同一根1分钟K线
@@ -678,33 +498,33 @@ class LiveMonitor:
                 if self.pending_signal is None:
                     self.pending_signal = signal
 
-        # 检查是否到了倒数第三根1分钟K线 (第13根，即minutes_in_period == 12)
-        # 新逻辑：只要倒数后三根1分钟K线中有任意一根的收盘价在K1区间内，就发送微信提醒
+        # 检查是否到了倒数第二根1分钟K线 (第13根，即minutes_in_period == 12)
+        # 新逻辑：只有倒数后三根1分钟K线都在前一根15分钟K线的高低区间内，才发送微信提醒
         if minutes_in_period == 12 and self.pending_signal and not self.popup_notified:
             # 获取倒数后三根1分钟K线
             klines_1m_last3 = self.api.get_latest_klines(symbol="BTCUSDT", interval="1m", limit=3)
             if len(klines_1m_last3) == 3:
+                # 只要后三根1分钟K线中任意一根的收盘价在15分钟K线区间内，即发送通知
                 any_in_range = False
                 for kline_data in klines_1m_last3:
                     k = SimpleKLine(kline_data)
-                    if ref_15m.low <= k.close <= ref_15m.high:
+                    if self.last_15m_kline.low <= k.close <= self.last_15m_kline.high:
                         any_in_range = True
                         break
                 if any_in_range:
                     print(f"\n\n{'='*80}")
-                    print(f"⏰ 15分钟周期倒数第三根K线，且后三根1分钟K线中有至少一根在K1区间内，发送微信通知!")
+                    print(f"⏰ 15分钟周期倒数第二根K线，且后三根1分钟K线中有任意一根在区间内，发送微信通知!")
                     print(f"{'='*80}\n")
                     self.send_notification(self.pending_signal, show_popup=True)
                     self.popup_notified = True
                 else:
                     print(f"\n\n{'='*80}")
-                    print(f"⏰ 15分钟周期倒数第三根K线，但后三根1分钟K线都不在K1区间内，不发送微信通知!")
+                    print(f"⏰ 15分钟周期倒数第二根K线，后三根1分钟K线均不在区间内，不发送微信通知!")
                     print(f"{'='*80}\n")
             else:
                 print(f"\n\n{'='*80}")
-                print(f"⚠️ 15分钟周期倒数第三根K线，获取后三根1分钟K线失败(网络问题)，不发送微信通知!")
+                print(f"⚠️ 15分钟周期倒数第二根K线，获取后三根1分钟K线失败(网络问题)，不发送微信通知!")
                 print(f"{'='*80}\n")
-
     
     def run(self, check_interval: int = 10):
         """
@@ -843,7 +663,7 @@ def main():
     
     # 策略参数
     min_k1_range_percent = 0.21  # 15分钟K线最小涨跌幅要求(%)
-    check_interval = 10  # 检查间隔(秒)，可以设置为5-15秒
+    check_interval = 30  # 检查间隔(秒)，可以设置为5-15秒
     # ==============================
     
     # 检查配置

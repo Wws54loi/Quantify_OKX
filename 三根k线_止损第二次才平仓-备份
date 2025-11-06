@@ -594,10 +594,10 @@ def main():
     """主函数"""
     # ====== 关键参数集中设置 ======
     leverage = 50               # 杠杆倍数
-    profit_target_percent = 60  # 止盈百分比（合约收益%）
+    profit_target_percent = 40  # 止盈百分比（合约收益%）
     stop_loss_percent = 74     # 止损百分比（合约亏损%）
     initial_capital = 1.0       # 每次投入资金（USDT）
-    min_k1_range_percent = 0.41  # 第一根K线开收涨跌幅要求（%）
+    min_k1_range_percent = 0.35  # 第一根K线开收涨跌幅要求（%）
     # ==============================
     
     # 计算现货价格需要变动的百分比

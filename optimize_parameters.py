@@ -13,7 +13,7 @@ def write_log_header(f, leverage, initial_capital, max_holding_bars_tp, max_hold
                      total_combinations, valid_results, high_winrate_count, part_info=None):
     """写入日志文件头部"""
     f.write("="*80 + "\n")
-    f.write("参数优化结果 - 胜率>=60%的所有策略\n")
+    f.write("参数优化结果 - 胜率>=60%的所有策略 (交易次数>=100)\n")
     if part_info:
         f.write(f"{part_info}\n")
     f.write("="*80 + "\n")
@@ -21,7 +21,7 @@ def write_log_header(f, leverage, initial_capital, max_holding_bars_tp, max_hold
     f.write(f"固定参数: 杠杆={leverage}x, 每次投入={initial_capital} USDT\n")
     f.write(f"超时平仓: 止盈>{max_holding_bars_tp}根K线, 止损>{max_holding_bars_sl}根K线\n")
     f.write(f"测试组合数: {total_combinations} 种\n")
-    f.write(f"有效组合数: {valid_results} 种\n")
+    f.write(f"有效组合数: {valid_results} 种 (交易次数>=100)\n")
     f.write(f"高胜率策略数: {high_winrate_count} 种 (胜率>=60%)\n")
     f.write("="*80 + "\n\n")
 
@@ -90,9 +90,9 @@ def optimize_parameters():
     max_holding_bars_sl = 102  # 止损超时阈值
     
     # ====== 参数搜索范围 ======
-    profit_target_range = range(20, 71, 1)  # 止盈: 20%, 21%, 22%, ..., 70%
-    stop_loss_range = range(20, 81, 1)      # 止损: 20%, 21%, 22%, ..., 80%
-    min_k1_range_range = [round(i * 0.01, 2) for i in range(10, 201)]  # K1涨跌幅: 0.10%, 0.11%, 0.12%, ..., 2.00%
+    profit_target_range = range(20, 61, 1)  # 止盈: 20%, 21%, 22%, ..., 60%
+    stop_loss_range = range(20, 61, 1)      # 止损: 20%, 21%, 22%, ..., 60%
+    min_k1_range_range = [round(i * 0.01, 2) for i in range(21, 201)]  # K1涨跌幅: 0.21%, 0.22%, 0.23%, ..., 2.00%
     
     print("="*80)
     print("参数优化系统 - 寻找最优止盈止损参数")
@@ -101,6 +101,7 @@ def optimize_parameters():
     print(f"  杠杆倍数: {leverage}x")
     print(f"  每次投入: {initial_capital} USDT")
     print(f"  超时平仓: 止盈>{max_holding_bars_tp}根K线, 止损>{max_holding_bars_sl}根K线")
+    print(f"  止损延迟: 前20根K线不设止损，之后在止损点等待回撤")
     print(f"\n搜索范围:")
     print(f"  止盈百分比: {min(profit_target_range)}% ~ {max(profit_target_range)}%")
     print(f"  止损百分比: {min(stop_loss_range)}% ~ {max(stop_loss_range)}%")
@@ -138,6 +139,10 @@ def optimize_parameters():
     for profit_pct, stop_pct, k1_pct in itertools.product(profit_target_range, stop_loss_range, min_k1_range_range):
         count += 1
         
+        # 确保止盈比止损大至少10个百分点
+        if profit_pct < stop_pct + 10:
+            continue
+        
         # 计算现货价格变动百分比
         price_profit_target = profit_pct / leverage / 100
         price_stop_loss = stop_pct / leverage / 100
@@ -152,14 +157,15 @@ def optimize_parameters():
             min_k1_range=min_k1_range,
             max_holding_bars_tp=max_holding_bars_tp,
             max_holding_bars_sl=max_holding_bars_sl,
-            allow_stop_loss_retry=True  # 允许止损重试
+            allow_stop_loss_retry=True,  # 允许止损重试
+            stop_loss_delay_bars=20  # 前20根K线不设止损
         )
         
         # 计算统计
         stats = strategy.calculate_win_rate(signals, leverage=leverage, initial_capital=initial_capital)
         
-        # 只记录有交易的结果
-        if stats['total_trades'] > 0:
+        # 只记录交易次数>=100的结果
+        if stats['total_trades'] >= 100:
             result = {
                 'profit_target_percent': profit_pct,
                 'stop_loss_percent': stop_pct,
@@ -191,11 +197,11 @@ def optimize_parameters():
     
     # 筛选胜率超过60%的策略
     high_winrate_results = [r for r in results if r['win_rate'] >= 60.0]
-    print(f"✓ 找到 {len(high_winrate_results)} 个胜率>=60%的策略")
+    print(f"✓ 找到 {len(high_winrate_results)} 个胜率>=60%的策略 (交易次数>=100)")
     
     # 显示TOP 10结果
     print("\n" + "="*80)
-    print("TOP 10 最高胜率参数组合 (允许止损重试)")
+    print("TOP 10 最高胜率参数组合 (允许止损重试, 交易次数>=100)")
     print("="*80)
     print("策略说明: 第一次触及止损点时不平仓，第二次到达止损点才卖出")
     print("="*80)

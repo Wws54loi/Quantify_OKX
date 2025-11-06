@@ -176,7 +176,8 @@ class ThreeKlineStrategy:
                     min_k1_range: float = 0.005,
                     max_holding_bars_tp: int = None,
                     max_holding_bars_sl: int = None,
-                    allow_stop_loss_retry: bool = True) -> List[Dict]:
+                    allow_stop_loss_retry: bool = True,
+                    stop_loss_delay_bars: int = 20) -> List[Dict]:
         """
         查找所有交易信号并模拟持仓直到触发止盈/止损
         
@@ -188,6 +189,7 @@ class ThreeKlineStrategy:
             max_holding_bars_tp: 止盈超时阈值(根K线数)，超过此时间未止盈则平仓
             max_holding_bars_sl: 止损超时阈值(根K线数)，超过此时间未止损则平仓
             allow_stop_loss_retry: 是否允许第一次触及止损点时不平仓，第二次才止损
+            stop_loss_delay_bars: 前N根K线不设止损点，之后才启用止损 (默认20根)
         
         返回:
             信号列表(仅包含已触发止盈/止损的交易)
@@ -250,6 +252,19 @@ class ThreeKlineStrategy:
                 direction = signal['direction']
                 stop_loss_hit_count = 0  # 止损触发次数计数器
                 
+                # 计算止盈目标价格：做多时目标是K1最高价，做空时目标是K1最低价
+                k1 = signal['k1']
+                if direction == 'long':
+                    target_price = k1.high  # 做多目标：回到K1最高价
+                    profit_target_dynamic = (target_price - entry_price) / entry_price
+                else:  # short
+                    target_price = k1.low   # 做空目标：回到K1最低价
+                    profit_target_dynamic = (entry_price - target_price) / entry_price
+                
+                # 如果动态止盈目标小于最小止盈要求，使用原止盈参数
+                if profit_target_dynamic < profit_target:
+                    profit_target_dynamic = profit_target
+                
                 # 从入场后的第一根K线开始监测
                 for j in range(entry_index, len(klines)):
                     current_kline = klines[j]
@@ -265,20 +280,20 @@ class ThreeKlineStrategy:
                         low_return = (entry_price - current_kline.high) / entry_price
                         current_return = (entry_price - current_kline.close) / entry_price
                     
-                    # 检查是否触发止盈
-                    if high_return >= profit_target:
+                    # 检查是否触发止盈（使用动态止盈目标）
+                    if high_return >= profit_target_dynamic:
                         signal['exit_type'] = 'take_profit'
-                        signal['exit_price'] = entry_price * (1 + profit_target) if direction == 'long' else entry_price * (1 - profit_target)
+                        signal['exit_price'] = target_price  # 使用目标价格（K1的最高/最低价）
                         signal['exit_time'] = current_kline.timestamp
                         signal['exit_index'] = j
                         signal['holding_bars'] = holding_bars
-                        signal['return'] = profit_target
+                        signal['return'] = profit_target_dynamic
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
                         signals.append(signal)
                         in_position = False
                         break
-                    # 检查是否触发止损
-                    elif low_return <= -stop_loss:
+                    # 检查是否触发止损（仅在持仓超过stop_loss_delay_bars根K线后才启用止损）
+                    elif holding_bars > stop_loss_delay_bars and low_return <= -stop_loss:
                         stop_loss_hit_count += 1
                         # 如果允许重试且是第一次触及止损，继续持仓
                         if allow_stop_loss_retry and stop_loss_hit_count == 1:
@@ -519,7 +534,7 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
             f.write(f"K线周期: 15分钟\n")
             f.write(f"交易模式: 合约 ({leverage}倍杠杆)\n")
             f.write(f"止盈设置: {profit_target_percent}% (价格变动 {price_profit_target:.2f}%)\n")
-            f.write(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss:.2f}%)\n")
+            f.write(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss:.2f}%) - 前20根K线不启用,之后等待回撤\n")
             f.write(f"K1涨跌幅要求: {min_k1_range_percent}%\n")
             f.write("="*80 + "\n\n")
             
@@ -590,9 +605,10 @@ def main():
     # ====== 关键参数集中设置 ======
     leverage = 50               # 杠杆倍数
     profit_target_percent = 40  # 止盈百分比（合约收益%）
-    stop_loss_percent = 99      # 止损百分比（合约亏损%）
+    stop_loss_percent = 40      # 止损百分比（合约亏损%）- 20根K线后启用
     initial_capital = 1.0       # 每次投入资金（USDT）
-    min_k1_range_percent = 0.44  # 第一根K线开收涨跌幅要求（%）
+    min_k1_range_percent = 0.46  # 第一根K线开收涨跌幅要求（%）
+    stop_loss_delay_bars = 48    # 前48根K线不设止损
     # ==============================
     
     # 计算现货价格需要变动的百分比
@@ -606,6 +622,7 @@ def main():
     print(f"交易对: BTCUSDT")
     print(f"K线周期: 15分钟")
     print(f"交易模式: 合约 ({leverage}倍杠杆)")
+    print(f"止损延迟: 前20根K线不设止损，之后在{stop_loss_percent}%处等待回撤")
     print(f"数据来源: 币安API")
     print("="*80)
     
@@ -662,7 +679,8 @@ def main():
     signals = strategy.find_signals(klines, 
                                     profit_target=price_profit_target,
                                     stop_loss=price_stop_loss,
-                                    min_k1_range=min_k1_range)
+                                    min_k1_range=min_k1_range,
+                                    stop_loss_delay_bars=stop_loss_delay_bars)
     print(f"找到 {len(signals)} 个已平仓交易 (触发止盈/止损)")
     
     # 打印信号详情
@@ -684,7 +702,7 @@ def main():
     print(f"{'='*80}")
     print(f"交易模式: 合约交易 ({leverage}倍杠杆)")
     print(f"止盈设置: {profit_target_percent}% (价格变动 {price_profit_target*100:.2f}%)")
-    print(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss*100:.2f}%)")
+    print(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss*100:.2f}%) - 前{stop_loss_delay_bars}根K线不启用")
     print(f"K1涨跌幅要求: {min_k1_range_percent}%")
     print(f"每次投入: {initial_capital} USDT")
     print(f"{'-'*80}")
