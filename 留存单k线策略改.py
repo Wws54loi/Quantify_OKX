@@ -610,7 +610,7 @@ def main():
     print("="*80)
     
     # K线数据缓存文件
-    cache_file = "btcusdt_15m_klines.json"
+    cache_file = "ethusdt_15m_klines.json"
     
     # 获取K线数据
     if os.path.exists(cache_file):

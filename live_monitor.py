@@ -182,6 +182,7 @@ class LiveMonitor:
         逻辑:
         1. 先检测是否有1分钟K线突破过15分钟K线的最高/最低点(记录状态)
         2. 后续1分钟K线收盘价回到区间内时,触发信号
+        3. 如果同时突破最高点和最低点(吞噬形态),返回'engulfed'信号,策略失效
         
         参数:
             k1_15m: 前一根15分钟K线(已完成)
@@ -189,6 +190,7 @@ class LiveMonitor:
         
         返回:
             如果满足条件返回信号字典,否则返回None
+            如果是吞噬形态,返回{'type': 'engulfed'}
         """
         # 检测是否突破最高点
         if k1_1m.high > k1_15m.high:
@@ -205,6 +207,14 @@ class LiveMonitor:
                 self.breakout_low_price = k1_1m.low
                 print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ⬇️ 检测到向下突破! 突破价:{k1_1m.low:.2f} < 参考最低:{k1_15m.low:.2f}")
                 print(f"    等待收盘价回到区间内 [{k1_15m.low:.2f} - {k1_15m.high:.2f}] 以触发做多信号...")
+        
+        # 检测吞噬形态: 同时突破最高点和最低点
+        if self.breakout_high and self.breakout_low:
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ⚠️ 检测到吞噬形态! 1分钟K线同时突破上下边界")
+            print(f"    最高突破: {self.breakout_high_price:.2f} > {k1_15m.high:.2f}")
+            print(f"    最低突破: {self.breakout_low_price:.2f} < {k1_15m.low:.2f}")
+            print(f"    策略失效，重新寻找符合条件的15分钟K线...")
+            return {'type': 'engulfed'}
         
         # 检查收盘价是否回到区间内
         close_in_range = k1_15m.low <= k1_1m.close <= k1_15m.high
@@ -489,6 +499,23 @@ class LiveMonitor:
         signal = self.check_signal(self.last_15m_kline, k1m)
 
         if signal:
+            # 检测到吞噬形态,策略失效,清除监听状态
+            if signal.get('type') == 'engulfed':
+                print(f"\n{'='*80}")
+                print(f"⚠️ 吞噬形态导致策略失效,停止当前监听")
+                print(f"{'='*80}\n")
+                # 清除监听状态,等待下一个符合条件的15分钟K线
+                self.last_15m_kline = None
+                self.current_15m_start_time = 0
+                self.alerted_signals.clear()
+                self.breakout_high = False
+                self.breakout_low = False
+                self.breakout_high_price = 0.0
+                self.breakout_low_price = 0.0
+                self.pending_signal = None
+                self.popup_notified = False
+                return
+            
             # 生成唯一标识，避免重复通知同一根1分钟K线
             signal_key = f"{signal['type']}_{k1m.timestamp}"
 

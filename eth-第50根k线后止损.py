@@ -177,9 +177,10 @@ class ThreeKlineStrategy:
                     max_holding_bars_tp: int = None,
                     max_holding_bars_sl: int = None,
                     allow_stop_loss_retry: bool = True,
-                    stop_loss_delay_bars: int = 20) -> List[Dict]:
+                    stop_loss_delay_bars: int = 20,
+                    leverage: int = 50) -> List[Dict]:
         """
-        查找所有交易信号并模拟持仓直到触发止盈/止损
+        查找所有交易信号并模拟持仓直到触发止盈/止损/爆仓
         
         参数:
             klines: K线列表
@@ -190,9 +191,10 @@ class ThreeKlineStrategy:
             max_holding_bars_sl: 止损超时阈值(根K线数)，超过此时间未止损则平仓
             allow_stop_loss_retry: 是否允许第一次触及止损点时不平仓，第二次才止损
             stop_loss_delay_bars: 前N根K线不设止损点，之后才启用止损 (默认20根)
+            leverage: 杠杆倍数，用于计算爆仓价 (默认50倍)
         
         返回:
-            信号列表(仅包含已触发止盈/止损的交易)
+            信号列表(仅包含已触发止盈/止损/爆仓的交易)
         """
         signals = []
         i = 0
@@ -280,8 +282,21 @@ class ThreeKlineStrategy:
                         low_return = (entry_price - current_kline.high) / entry_price
                         current_return = (entry_price - current_kline.close) / entry_price
                     
+                    # 检查是否爆仓（合约亏损达到100%，即现货价格变动达到1/杠杆）
+                    liquidation_threshold = -1.0 / leverage
+                    if low_return <= liquidation_threshold:
+                        signal['exit_type'] = 'liquidation'
+                        signal['exit_price'] = entry_price * (1 + liquidation_threshold) if direction == 'long' else entry_price * (1 - liquidation_threshold)
+                        signal['exit_time'] = current_kline.timestamp
+                        signal['exit_index'] = j
+                        signal['holding_bars'] = holding_bars
+                        signal['return'] = liquidation_threshold
+                        signal['stop_loss_hit_count'] = stop_loss_hit_count
+                        signals.append(signal)
+                        in_position = False
+                        break
                     # 检查是否触发止盈（使用动态止盈目标）
-                    if high_return >= profit_target_dynamic:
+                    elif high_return >= profit_target_dynamic:
                         signal['exit_type'] = 'take_profit'
                         signal['exit_price'] = target_price  # 使用目标价格（K1的最高/最低价）
                         signal['exit_time'] = current_kline.timestamp
@@ -373,6 +388,7 @@ class ThreeKlineStrategy:
         
         wins = 0
         losses = 0
+        liquidations = 0  # 爆仓次数
         profits = []
         losses_list = []
         holding_bars_list = []
@@ -403,6 +419,11 @@ class ThreeKlineStrategy:
                 wins += 1
                 profits.append(return_pct)
                 result = '超时止盈'
+            elif exit_type == 'liquidation':
+                losses += 1
+                liquidations += 1
+                losses_list.append(return_pct)
+                result = '爆仓'
             elif exit_type == 'stop_loss':
                 losses += 1
                 losses_list.append(return_pct)
@@ -450,6 +471,7 @@ class ThreeKlineStrategy:
             'total_trades': total_trades,
             'wins': wins,
             'losses': losses,
+            'liquidations': liquidations,
             'win_rate': win_rate,
             'avg_profit': avg_profit * 100,  # 转换为百分比
             'avg_loss': avg_loss * 100,  # 转换为百分比
@@ -533,6 +555,7 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
             f.write(f"交易对: ETHUSDT\n")
             f.write(f"K线周期: 15分钟\n")
             f.write(f"交易模式: 合约 ({leverage}倍杠杆)\n")
+            f.write(f"爆仓阈值: 100% (价格变动 {100/leverage:.2f}%)\n")
             f.write(f"止盈设置: {profit_target_percent}% (价格变动 {price_profit_target:.2f}%)\n")
             f.write(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss:.2f}%) - 前20根K线不启用,之后等待回撤\n")
             f.write(f"K1涨跌幅要求: {min_k1_range_percent}%\n")
@@ -543,7 +566,7 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
             f.write(f"总信号数: {stats['total_signals']}\n")
             f.write(f"总交易数: {stats['total_trades']}\n")
             f.write(f"盈利次数: {stats['wins']}\n")
-            f.write(f"亏损次数: {stats['losses']}\n")
+            f.write(f"亏损次数: {stats['losses']} (其中爆仓 {stats['liquidations']} 笔)\n")
             f.write(f"胜率: {stats['win_rate']:.2f}%\n")
             f.write(f"平均盈利: {stats['avg_profit']*leverage:.2f}% (合约收益)\n")
             f.write(f"平均亏损: {stats['avg_loss']*leverage:.2f}% (合约亏损)\n")
@@ -608,7 +631,7 @@ def main():
     stop_loss_percent = 40      # 止损百分比（合约亏损%）- 20根K线后启用
     initial_capital = 1.0       # 每次投入资金（USDT）
     min_k1_range_percent = 0.42  # 第一根K线开收涨跌幅要求（%）
-    stop_loss_delay_bars = 50    # 前50根K线不设止损
+    stop_loss_delay_bars = 8    # 前50根K线不设止损
     # ==============================
     
     # 计算现货价格需要变动的百分比
@@ -622,6 +645,7 @@ def main():
     print(f"交易对: ETHUSDT")
     print(f"K线周期: 15分钟")
     print(f"交易模式: 合约 ({leverage}倍杠杆)")
+    print(f"爆仓阈值: 100% (价格变动 {100/leverage:.2f}%)")
     print(f"止损延迟: 前50根K线不设止损，之后在{stop_loss_percent}%处等待回撤")
     print(f"数据来源: 币安API")
     print("="*80)
@@ -697,10 +721,11 @@ def main():
     stats['min_k1_range_percent'] = min_k1_range_percent
     
     # 打印统计结果
-    print(f"\n{'='*80}")
+    print(f"{'='*80}")
     print("策略统计结果")
     print(f"{'='*80}")
     print(f"交易模式: 合约交易 ({leverage}倍杠杆)")
+    print(f"爆仓阈值: 100% (价格变动 {100/leverage:.2f}%)")
     print(f"止盈设置: {profit_target_percent}% (价格变动 {price_profit_target*100:.2f}%)")
     print(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss*100:.2f}%) - 前{stop_loss_delay_bars}根K线不启用")
     print(f"K1涨跌幅要求: {min_k1_range_percent}%")
@@ -708,7 +733,7 @@ def main():
     print(f"{'-'*80}")
     print(f"总交易数: {stats['total_trades']} (仅统计已触发止盈/止损的交易)")
     print(f"盈利次数: {stats['wins']} (止盈)")
-    print(f"亏损次数: {stats['losses']} (止损)")
+    print(f"亏损次数: {stats['losses']} (其中爆仓 {stats['liquidations']} 笔)")
     print(f"胜率: {stats['win_rate']:.2f}%")
     print(f"平均盈利: {stats['avg_profit']*leverage:.2f}% (合约收益)")
     print(f"平均亏损: {stats['avg_loss']*leverage:.2f}% (合约亏损)")
@@ -740,7 +765,8 @@ def main():
     
     print("\n注意事项:")
     print("- 本统计仅供参考，实际交易需考虑手续费、滑点、资金费率等因素")
-    print(f"- 合约交易风险极高，{leverage}倍杠杆下价格波动{price_stop_loss*100:.2f}%即触发止损")
+    print(f"- 合约交易风险极高，{leverage}倍杠杆下价格反向波动{100/leverage:.2f}%即爆仓（本金亏损100%）")
+    print(f"- 止损设置在{stop_loss_percent}%（价格变动{price_stop_loss*100:.2f}%），前{stop_loss_delay_bars}根K线不启用")
     print("- 建议严格执行止损，控制仓位，避免爆仓风险")
     
     # 导出日志
