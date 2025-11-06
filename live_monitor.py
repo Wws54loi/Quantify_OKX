@@ -466,6 +466,13 @@ class LiveMonitor:
         time_since_15m_start = (k1m.timestamp - self.current_15m_start_time) / 60000  # 转换为分钟
         minutes_in_period = int(time_since_15m_start)
 
+        # 检查是否还在当前15分钟周期内 (如果超过15分钟,说明进入了新周期)
+        if k1m.timestamp < self.current_15m_start_time or minutes_in_period >= 15:
+            # 新周期开始,等待下次15分钟K线更新
+            if minutes_in_period >= 15:
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 15分钟周期已结束，等待下一个周期...")
+            return
+
         # 打印每分钟K线 (包含突破状态和周期位置)
         status = ""
         if self.breakout_high:
@@ -477,10 +484,6 @@ class LiveMonitor:
             status += f" [有信号-等待第13分钟弹窗]"
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 1分钟K线({minutes_in_period+1}/15): O:{k1m.open:.2f} H:{k1m.high:.2f} L:{k1m.low:.2f} C:{k1m.close:.2f}{status}", end='\r')
-
-        # 检查是否还在当前15分钟周期内
-        if k1m.timestamp < self.current_15m_start_time:
-            return
 
         # 检查是否满足信号条件
         signal = self.check_signal(self.last_15m_kline, k1m)
@@ -499,27 +502,41 @@ class LiveMonitor:
                     self.pending_signal = signal
 
         # 检查是否到了倒数第二根1分钟K线 (第13根，即minutes_in_period == 12)
-        # 新逻辑：只有倒数后三根1分钟K线都在前一根15分钟K线的高低区间内，才发送微信提醒
+        # 新逻辑：只要后三根1分钟K线中任意一根在区间内，就发送微信提醒
         if minutes_in_period == 12 and self.pending_signal and not self.popup_notified:
             # 获取倒数后三根1分钟K线
             klines_1m_last3 = self.api.get_latest_klines(symbol="BTCUSDT", interval="1m", limit=3)
             if len(klines_1m_last3) == 3:
                 # 只要后三根1分钟K线中任意一根的收盘价在15分钟K线区间内，即发送通知
                 any_in_range = False
-                for kline_data in klines_1m_last3:
+                in_range_count = 0
+                
+                print(f"\n\n{'='*80}")
+                print(f"📊 检查后三根1分钟K线 (15分钟K线区间: [{self.last_15m_kline.low:.2f} - {self.last_15m_kline.high:.2f}])")
+                print(f"{'-'*80}")
+                
+                for i, kline_data in enumerate(klines_1m_last3, 1):
                     k = SimpleKLine(kline_data)
-                    if self.last_15m_kline.low <= k.close <= self.last_15m_kline.high:
+                    is_in_range = self.last_15m_kline.low <= k.close <= self.last_15m_kline.high
+                    status = "✓ 在区间内" if is_in_range else "✗ 不在区间内"
+                    time_str = datetime.fromtimestamp(k.timestamp/1000).strftime('%H:%M')
+                    print(f"  第{i}根 [{time_str}]: 收盘价 {k.close:.2f} {status}")
+                    
+                    if is_in_range:
                         any_in_range = True
-                        break
+                        in_range_count += 1
+                
+                print(f"{'-'*80}")
+                print(f"统计: {in_range_count}/3 根K线在区间内")
+                print(f"{'='*80}")
+                
                 if any_in_range:
-                    print(f"\n\n{'='*80}")
-                    print(f"⏰ 15分钟周期倒数第二根K线，且后三根1分钟K线中有任意一根在区间内，发送微信通知!")
+                    print(f"✅ 发送微信通知! (有{in_range_count}根K线在区间内)")
                     print(f"{'='*80}\n")
                     self.send_notification(self.pending_signal, show_popup=True)
                     self.popup_notified = True
                 else:
-                    print(f"\n\n{'='*80}")
-                    print(f"⏰ 15分钟周期倒数第二根K线，后三根1分钟K线均不在区间内，不发送微信通知!")
+                    print(f"❌ 不发送微信通知 (后三根K线均不在区间内)")
                     print(f"{'='*80}\n")
             else:
                 print(f"\n\n{'='*80}")
