@@ -86,7 +86,7 @@ def optimize_parameters():
     initial_capital = 1.0  # 每次投入
     
     # ====== 参数搜索范围 ======
-    stop_loss_delay_bars_range = range(0, 11, 1)  # 止损延迟: 0, 1, 2, ..., 50根K线
+    stop_loss_delay_bars_range = range(0, 51, 1)  # 止损延迟: 0, 1, 2, ..., 50根K线
     min_k1_range_range = [round(i * 0.01, 2) for i in range(10, 201)]  # K1涨跌幅: 0.10%, 0.11%, ..., 2.00%
     
     print("="*80)
