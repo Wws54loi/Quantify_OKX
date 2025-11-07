@@ -12,6 +12,8 @@
   - 第一根K线的开盘价和收盘价必须有起码0.5%的涨跌幅
   - 第二根K线的最低价或最高价突破第一根K线
   - 但第二根K线的实体部分仍在第一根K线范围内
+  - 第二根K线的影线总长度不能大于实体长度（新增规则1）
+  - 第二根K线的实体率必须≥30%（新增规则2）
   - 向下突破做多（预期反弹），向上突破做空（预期回落）
   - 在第二根K线收盘价入场
 
@@ -140,6 +142,8 @@ class ThreeKlineStrategy:
         - 第一根K线的开盘价和收盘价必须有起码0.5%的涨跌幅
         - 第二根K线的最低价或最高价突破第一根K线
         - 但第二根K线的实体部分仍在第一根K线范围内
+        - 第二根K线的影线总长度不能大于实体长度（新增规则1）
+        - 第二根K线的实体率必须≥30%（新增规则2）
         
         参数:
             k1: 第一根K线
@@ -158,6 +162,27 @@ class ThreeKlineStrategy:
         body_in_range = (k2.body_high <= k1.high and k2.body_low >= k1.low)
         
         if not body_in_range:
+            return (False, None)
+        
+        # 新增规则1：检查第二根K线的影线是否比实体长
+        k2_body_length = abs(k2.close - k2.open)  # 实体长度
+        k2_upper_shadow = k2.high - k2.body_high   # 上影线长度
+        k2_lower_shadow = k2.body_low - k2.low     # 下影线长度
+        k2_total_shadow = k2_upper_shadow + k2_lower_shadow  # 总影线长度
+        
+        # 如果影线总长度大于实体长度，则不符合条件
+        if k2_total_shadow > k2_body_length:
+            return (False, None)
+        
+        # 新增规则2：检查第二根K线的实体强度
+        k2_total_range = k2.high - k2.low  # K2总长度
+        if k2_total_range > 0:
+            k2_body_ratio = k2_body_length / k2_total_range  # 实体占比
+            # 实体率必须≥30%
+            if k2_body_ratio < 0.30:
+                return (False, None)
+        else:
+            # 如果K2没有波动（十字线），直接过滤
             return (False, None)
         
         # 向下突破 -> 做多信号（预期反弹）
@@ -348,6 +373,9 @@ class ThreeKlineStrategy:
                 'total_signals': 0,
                 'wins': 0,
                 'losses': 0,
+                'take_profit_count': 0,
+                'partial_profit_count': 0,
+                'stop_loss_count': 0,
                 'win_rate': 0.0,
                 'avg_profit': 0.0,
                 'avg_loss': 0.0,
@@ -359,6 +387,9 @@ class ThreeKlineStrategy:
         
         wins = 0
         losses = 0
+        take_profit_count = 0  # 完全止盈次数
+        partial_profit_count = 0  # 部分止盈次数
+        stop_loss_count = 0  # 止损次数
         liquidations = 0  # 爆仓次数
         profits = []
         losses_list = []
@@ -384,10 +415,12 @@ class ThreeKlineStrategy:
             # 判断盈亏
             if exit_type == 'take_profit':
                 wins += 1
+                take_profit_count += 1
                 profits.append(return_pct)
                 result = '止盈'
             elif exit_type == 'partial_profit':
                 wins += 1
+                partial_profit_count += 1
                 profits.append(return_pct)
                 result = '部分止盈'
             elif exit_type == 'timeout_profit':
@@ -397,10 +430,12 @@ class ThreeKlineStrategy:
             elif exit_type == 'liquidation':
                 losses += 1
                 liquidations += 1
+                stop_loss_count += 1
                 losses_list.append(return_pct)
                 result = '爆仓'
             elif exit_type == 'stop_loss':
                 losses += 1
+                stop_loss_count += 1
                 losses_list.append(return_pct)
                 result = '止损'
             else:  # timeout_loss
@@ -446,6 +481,9 @@ class ThreeKlineStrategy:
             'total_trades': total_trades,
             'wins': wins,
             'losses': losses,
+            'take_profit_count': take_profit_count,
+            'partial_profit_count': partial_profit_count,
+            'stop_loss_count': stop_loss_count,
             'liquidations': liquidations,
             'win_rate': win_rate,
             'avg_profit': avg_profit * 100,  # 转换为百分比
@@ -540,7 +578,10 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
             f.write(f"总信号数: {stats['total_signals']}\n")
             f.write(f"总交易数: {stats['total_trades']}\n")
             f.write(f"盈利次数: {stats['wins']}\n")
+            f.write(f"  - 完全止盈: {stats.get('take_profit_count', 0)}\n")
+            f.write(f"  - 部分止盈: {stats.get('partial_profit_count', 0)}\n")
             f.write(f"亏损次数: {stats['losses']}\n")
+            f.write(f"  - 止损: {stats.get('stop_loss_count', 0)}\n")
             f.write(f"胜率: {stats['win_rate']:.2f}%\n")
             f.write(f"平均盈利: {stats['avg_profit']*leverage:.2f}% (合约收益)\n")
             f.write(f"平均亏损: {stats['avg_loss']*leverage:.2f}% (合约亏损)\n")
@@ -705,7 +746,10 @@ def main():
     print(f"{'-'*80}")
     print(f"总交易数: {stats['total_trades']} (仅统计已触发止盈/止损的交易)")
     print(f"盈利次数: {stats['wins']} (止盈)")
+    print(f"  - 完全止盈: {stats.get('take_profit_count', 0)} ({stats.get('take_profit_count', 0)/stats['total_trades']*100:.1f}%)")
+    print(f"  - 部分止盈: {stats.get('partial_profit_count', 0)} ({stats.get('partial_profit_count', 0)/stats['total_trades']*100:.1f}%)")
     print(f"亏损次数: {stats['losses']} (止损)")
+    print(f"  - 止损: {stats.get('stop_loss_count', 0)} ({stats.get('stop_loss_count', 0)/stats['total_trades']*100:.1f}%)")
     print(f"胜率: {stats['win_rate']:.2f}%")
     print(f"平均盈利: {stats['avg_profit']*leverage:.2f}% (合约收益)")
     print(f"平均亏损: {stats['avg_loss']*leverage:.2f}% (合约亏损)")

@@ -134,7 +134,7 @@ class ThreeKlineStrategy:
         """
         return k2.high <= k1.high and k2.low >= k1.low
     
-    def check_rule1(self, k1: KLine, k2: KLine, min_range_percent: float = 0.005) -> tuple:
+    def check_rule1(self, k1: KLine, k2: KLine, min_range_percent: float = 0.005, max_range_percent: float = 0.005) -> tuple:
         """
         检查法则1: 
         - 第一根K线的开盘价和收盘价必须有起码0.5%的涨跌幅
@@ -145,13 +145,14 @@ class ThreeKlineStrategy:
             k1: 第一根K线
             k2: 第二根K线
             min_range_percent: K1最小涨跌幅要求，默认0.5%
+            max_range_percent: K1最大涨跌幅要求，默认0.5%
         
         返回:
             (是否满足, 方向) - 方向为 'long' 做多 或 'short' 做空，不满足则返回 (False, None)
         """
-        # 检查K1的涨跌幅是否满足最小要求(使用开盘价和收盘价)
+        # 检查K1的涨跌幅是否满足最小和最大要求(使用开盘价和收盘价)
         k1_range = abs(k1.close - k1.open) / k1.open
-        if k1_range < min_range_percent:
+        if k1_range < min_range_percent or k1_range > max_range_percent:
             return (False, None)
         
         # 检查实体是否在第一根K线范围内
@@ -174,6 +175,7 @@ class ThreeKlineStrategy:
                     profit_target: float = 0.008, 
                     stop_loss: float = 1.0,  # 止损100%
                     min_k1_range: float = 0.005,
+                    max_k1_range: float = 0.005,
                     max_holding_bars_tp: int = None,
                     max_holding_bars_sl: int = None,
                     allow_stop_loss_retry: bool = True,
@@ -187,6 +189,7 @@ class ThreeKlineStrategy:
             profit_target: 止盈百分比 (现货价格变动)
             stop_loss: 止损百分比 (现货价格变动)
             min_k1_range: K1最小涨跌幅要求 (小数形式，如0.005表示0.5%)
+            max_k1_range: K1最大涨跌幅要求 (小数形式，如0.005表示0.5%)
             max_holding_bars_tp: 止盈超时阈值(根K线数)，超过此时间未止盈则平仓
             max_holding_bars_sl: 止损超时阈值(根K线数)，超过此时间未止损则平仓
             allow_stop_loss_retry: 是否允许第一次触及止损点时不平仓，第二次才止损
@@ -214,7 +217,7 @@ class ThreeKlineStrategy:
             # 检查法则2: k2被k1包含
             if i < len(klines) - 2 and self.is_contained(k1, k2):
                 k3 = klines[i + 2]
-                is_valid, direction = self.check_rule1(k1, k3, min_k1_range)
+                is_valid, direction = self.check_rule1(k1, k3, min_k1_range, max_k1_range)
                 if is_valid:
                     signal = {
                         'type': 'rule2',
@@ -230,7 +233,7 @@ class ThreeKlineStrategy:
                     in_position = True
                     i += 2
             else:
-                is_valid, direction = self.check_rule1(k1, k2, min_k1_range)
+                is_valid, direction = self.check_rule1(k1, k2, min_k1_range, max_k1_range)
                 if is_valid:
                     signal = {
                         'type': 'rule1',
@@ -360,6 +363,8 @@ class ThreeKlineStrategy:
         wins = 0
         losses = 0
         liquidations = 0  # 爆仓次数
+        take_profit_count = 0  # 完全止盈次数
+        partial_profit_count = 0  # 部分止盈次数
         profits = []
         losses_list = []
         holding_bars_list = []
@@ -384,10 +389,12 @@ class ThreeKlineStrategy:
             # 判断盈亏
             if exit_type == 'take_profit':
                 wins += 1
+                take_profit_count += 1
                 profits.append(return_pct)
-                result = '止盈'
+                result = '完全止盈'
             elif exit_type == 'partial_profit':
                 wins += 1
+                partial_profit_count += 1
                 profits.append(return_pct)
                 result = '部分止盈'
             elif exit_type == 'timeout_profit':
@@ -447,6 +454,8 @@ class ThreeKlineStrategy:
             'wins': wins,
             'losses': losses,
             'liquidations': liquidations,
+            'take_profit_count': take_profit_count,
+            'partial_profit_count': partial_profit_count,
             'win_rate': win_rate,
             'avg_profit': avg_profit * 100,  # 转换为百分比
             'avg_loss': avg_loss * 100,  # 转换为百分比
@@ -519,6 +528,7 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
         profit_target_percent = stats.get('profit_target_percent', 40)
         stop_loss_percent = stats.get('stop_loss_percent', 20)
         min_k1_range_percent = stats.get('min_k1_range_percent', 0.5)
+        max_k1_range_percent = stats.get('max_k1_range_percent', 0.5)
         price_profit_target = profit_target_percent / leverage
         price_stop_loss = stop_loss_percent / leverage
         
@@ -532,7 +542,7 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
             f.write(f"交易模式: 合约 ({leverage}倍杠杆)\n")
             f.write(f"止盈设置: {profit_target_percent}% (价格变动 {price_profit_target:.2f}%)\n")
             f.write(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss:.2f}%) - 前20根K线不启用,之后等待回撤\n")
-            f.write(f"K1涨跌幅要求: {min_k1_range_percent}%\n")
+            f.write(f"K1涨跌幅区间: {min_k1_range_percent}% - {max_k1_range_percent}%\n")
             f.write("="*80 + "\n\n")
             
             f.write("策略统计摘要:\n")
@@ -602,16 +612,18 @@ def main():
     # ====== 关键参数集中设置 ======
     leverage = 50               # 杠杆倍数
     profit_target_percent = 40  # 止盈百分比（合约收益%）
-    stop_loss_percent = 100     # 止损百分比（合约亏损%）- 10根K线后启用
+    stop_loss_percent = 100     # 止损百分比（合约亏损%）
     initial_capital = 1.0       # 每次投入资金（USDT）
-    min_k1_range_percent = 0.46  # 第一根K线开收涨跌幅要求（%）
-    stop_loss_delay_bars = 10    # 前10根K线不设止损
+    min_k1_range_percent = 0.2  # 第一根K线开收涨跌幅最小要求（%）
+    max_k1_range_percent = 0.51   # 第一根K线开收涨跌幅最大要求（%）
+    stop_loss_delay_bars = 5    
     # ==============================
     
     # 计算现货价格需要变动的百分比
     price_profit_target = profit_target_percent / leverage / 100
     price_stop_loss = stop_loss_percent / leverage / 100
     min_k1_range = min_k1_range_percent / 100
+    max_k1_range = max_k1_range_percent / 100
     
     print("="*80)
     print("三K线策略胜率统计系统")
@@ -619,6 +631,7 @@ def main():
     print(f"交易对: BTCUSDT")
     print(f"K线周期: 15分钟")
     print(f"交易模式: 合约 ({leverage}倍杠杆)")
+    print(f"K1涨跌幅区间: {min_k1_range_percent}% - {max_k1_range_percent}%")
     print(f"止损延迟: 前{stop_loss_delay_bars}根K线不设止损，之后在{stop_loss_percent}%处等待回撤")
     print(f"数据来源: 币安API")
     print("="*80)
@@ -677,6 +690,7 @@ def main():
                                     profit_target=price_profit_target,
                                     stop_loss=price_stop_loss,
                                     min_k1_range=min_k1_range,
+                                    max_k1_range=max_k1_range,
                                     stop_loss_delay_bars=stop_loss_delay_bars)
     print(f"找到 {len(signals)} 个已平仓交易 (触发止盈/止损)")
     
@@ -692,6 +706,7 @@ def main():
     stats['profit_target_percent'] = profit_target_percent
     stats['stop_loss_percent'] = stop_loss_percent
     stats['min_k1_range_percent'] = min_k1_range_percent
+    stats['max_k1_range_percent'] = max_k1_range_percent
     
     # 打印统计结果
     print(f"\n{'='*80}")
@@ -700,11 +715,11 @@ def main():
     print(f"交易模式: 合约交易 ({leverage}倍杠杆)")
     print(f"止盈设置: {profit_target_percent}% (价格变动 {price_profit_target*100:.2f}%)")
     print(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss*100:.2f}%) - 前{stop_loss_delay_bars}根K线不启用")
-    print(f"K1涨跌幅要求: {min_k1_range_percent}%")
+    print(f"K1涨跌幅区间: {min_k1_range_percent}% - {max_k1_range_percent}%")
     print(f"每次投入: {initial_capital} USDT")
     print(f"{'-'*80}")
     print(f"总交易数: {stats['total_trades']} (仅统计已触发止盈/止损的交易)")
-    print(f"盈利次数: {stats['wins']} (止盈)")
+    print(f"盈利次数: {stats['wins']} (完全止盈: {stats['take_profit_count']}, 部分止盈: {stats['partial_profit_count']})")
     print(f"亏损次数: {stats['losses']} (止损)")
     print(f"胜率: {stats['win_rate']:.2f}%")
     print(f"平均盈利: {stats['avg_profit']*leverage:.2f}% (合约收益)")
