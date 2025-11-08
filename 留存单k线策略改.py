@@ -140,6 +140,7 @@ class ThreeKlineStrategy:
         - 第一根K线的开盘价和收盘价必须有起码0.5%的涨跌幅
         - 第二根K线的最低价或最高价突破第一根K线
         - 但第二根K线的实体部分仍在第一根K线范围内
+        - K2实体与K1实体比值不能在以下区间：0.00-0.10, 0.20-0.30, 0.40-0.50, 0.90-1.10, 1.60-1.70
         
         参数:
             k1: 第一根K线
@@ -160,6 +161,22 @@ class ThreeKlineStrategy:
         if not body_in_range:
             return (False, None)
         
+        # 计算K2实体与K1实体的比值
+        k1_body = abs(k1.close - k1.open)
+        k2_body = abs(k2.close - k2.open)
+        
+        # 避免除零错误
+        if k1_body > 0:
+            body_ratio = k2_body / k1_body
+            # 检查比值是否在禁止区间内
+            # 禁止区间: 0.00-0.10, 0.20-0.30, 0.40-0.50, 0.9-1.10, 1.6-1.7
+            if ((0.00 <= body_ratio <= 0.10) or 
+                (0.20 <= body_ratio <= 0.30) or 
+                (0.40 <= body_ratio <= 0.50) or 
+                (0.90 <= body_ratio <= 1.10) or 
+                (1.60 <= body_ratio <= 1.70)):
+                return (False, None)
+        
         # 向下突破 -> 做多信号（预期反弹）
         if k2.low < k1.low:
             return (True, 'long')
@@ -176,7 +193,8 @@ class ThreeKlineStrategy:
                     min_k1_range: float = 0.005,
                     max_holding_bars_tp: int = None,
                     max_holding_bars_sl: int = None,
-                    allow_stop_loss_retry: bool = True) -> List[Dict]:
+                    allow_stop_loss_retry: bool = True,
+                    filter_overlap_within_10_bars: bool = True) -> List[Dict]:
         """
         查找所有交易信号并模拟持仓直到触发止盈/止损
         
@@ -188,6 +206,7 @@ class ThreeKlineStrategy:
             max_holding_bars_tp: 止盈超时阈值(根K线数)，超过此时间未止盈则平仓
             max_holding_bars_sl: 止损超时阈值(根K线数)，超过此时间未止损则平仓
             allow_stop_loss_retry: 是否允许第一次触及止损点时不平仓，第二次才止损
+            filter_overlap_within_10_bars: 是否过滤十根K线内的重叠交易（默认True）
         
         返回:
             信号列表(仅包含已触发止盈/止损的交易)
@@ -195,12 +214,20 @@ class ThreeKlineStrategy:
         signals = []
         i = 0
         in_position = False  # 是否持仓中
+        last_entry_index = None  # 记录上一次入场的K线索引
+        last_exit_index = None   # 记录上一次出场的K线索引
         
         while i < len(klines) - 2:
             # 如果已经持仓,跳过新信号检测
             if in_position:
                 i += 1
                 continue
+            
+            # 如果设置了过滤，检查是否在上一次交易的10根K线内
+            if filter_overlap_within_10_bars and last_exit_index is not None:
+                if i <= last_exit_index + 10:
+                    i += 1
+                    continue
                 
             k1 = klines[i]
             k2 = klines[i + 1]
@@ -276,6 +303,7 @@ class ThreeKlineStrategy:
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
                         signals.append(signal)
                         in_position = False
+                        last_exit_index = j  # 记录出场索引
                         break
                     # 检查是否触发止损
                     elif low_return <= -stop_loss:
@@ -293,6 +321,7 @@ class ThreeKlineStrategy:
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
                         signals.append(signal)
                         in_position = False
+                        last_exit_index = j  # 记录出场索引
                         break
                     # 检查止盈超时（如果设置了）
                     elif max_holding_bars_tp is not None and holding_bars > max_holding_bars_tp and current_return > 0:
@@ -305,6 +334,7 @@ class ThreeKlineStrategy:
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
                         signals.append(signal)
                         in_position = False
+                        last_exit_index = j  # 记录出场索引
                         break
                     # 检查止损超时（如果设置了）
                     elif max_holding_bars_sl is not None and holding_bars > max_holding_bars_sl and current_return <= 0:
@@ -317,6 +347,7 @@ class ThreeKlineStrategy:
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
                         signals.append(signal)
                         in_position = False
+                        last_exit_index = j  # 记录出场索引
                         break
                 
                 # 如果循环结束还没触发,说明到最新时间都没平仓,不纳入统计
@@ -358,6 +389,9 @@ class ThreeKlineStrategy:
         
         wins = 0
         losses = 0
+        rule2_trades = 0
+        rule2_wins = 0
+        rule2_losses = 0
         profits = []
         losses_list = []
         holding_bars_list = []
@@ -396,6 +430,13 @@ class ThreeKlineStrategy:
                 losses += 1
                 losses_list.append(return_pct)
                 result = '超时止损'
+            # 统计包含关系（rule2）
+            if signal.get('type') == 'rule2':
+                rule2_trades += 1
+                if result in ('止盈', '超时止盈'):
+                    rule2_wins += 1
+                else:
+                    rule2_losses += 1
             
             # 计算百分比
             price_change_percent = return_pct * 100
@@ -417,11 +458,25 @@ class ThreeKlineStrategy:
                 'pnl': pnl,
                 'cumulative_capital': total_capital,
                 'result': result,
+                # K1信息（完整）
+                'k1_open': signal['k1'].open,
                 'k1_high': signal['k1'].high,
                 'k1_low': signal['k1'].low,
+                'k1_close': signal['k1'].close,
+                # K2信息（完整）
+                'k2_open': signal['k2'].open,
                 'k2_high': signal['k2'].high,
                 'k2_low': signal['k2'].low,
+                'k2_close': signal['k2'].close,
             }
+            
+            # 如果是包含关系（rule2），添加K3信息
+            if signal.get('type') == 'rule2' and 'k3' in signal:
+                trade_detail['k3_open'] = signal['k3'].open
+                trade_detail['k3_high'] = signal['k3'].high
+                trade_detail['k3_low'] = signal['k3'].low
+                trade_detail['k3_close'] = signal['k3'].close
+            
             trade_details.append(trade_detail)
         
         total_trades = wins + losses
@@ -445,7 +500,13 @@ class ThreeKlineStrategy:
             'total_pnl': total_capital,
             'final_capital': total_trades * initial_capital + total_capital,
             'profit_factor': abs(sum(profits) / sum(losses_list)) if losses_list and sum(losses_list) != 0 else float('inf'),
-            'trade_details': trade_details
+            'trade_details': trade_details,
+            'rule2_trades': rule2_trades,
+            'rule2_wins': rule2_wins,
+            'rule2_losses': rule2_losses,
+            'rule1_trades': total_trades - rule2_trades,
+            'rule1_wins': wins - rule2_wins,
+            'rule1_losses': losses - rule2_losses
         }
 
 
@@ -455,10 +516,14 @@ def export_to_csv(trade_details: List[Dict], filename: str = "trade_log.csv"):
         print("没有交易数据可导出")
         return
     
+    # 基础字段
     fieldnames = [
-        '交易编号', '策略类型', '方向', '入场时间', '入场价格', 
+        '交易编号', '策略类型', '包含关系', '方向', '入场时间', '入场价格', 
         '出场时间', '出场价格', '持仓K线数', '持仓时长', '价格变动%', '合约收益%', 
-        '盈亏USDT', '累计资金USDT', '结果', 'K1最高', 'K1最低', 'K2最高', 'K2最低'
+        '盈亏USDT', '累计资金USDT', '结果', 
+        'K1开盘', 'K1最高', 'K1最低', 'K1收盘',
+        'K2开盘', 'K2最高', 'K2最低', 'K2收盘',
+        'K3开盘', 'K3最高', 'K3最低', 'K3收盘'
     ]
     
     try:
@@ -467,9 +532,10 @@ def export_to_csv(trade_details: List[Dict], filename: str = "trade_log.csv"):
             writer.writeheader()
             
             for trade in trade_details:
-                writer.writerow({
+                row_data = {
                     '交易编号': trade['trade_id'],
                     '策略类型': trade['signal_type'],
+                    '包含关系': '是' if trade.get('signal_type') == 'rule2' else '否',
                     '方向': trade['direction'],
                     '入场时间': trade['entry_time'],
                     '入场价格': f"{trade['entry_price']:.2f}",
@@ -482,11 +548,29 @@ def export_to_csv(trade_details: List[Dict], filename: str = "trade_log.csv"):
                     '盈亏USDT': f"{trade['pnl']:.4f}",
                     '累计资金USDT': f"{trade['cumulative_capital']:.4f}",
                     '结果': trade['result'],
+                    'K1开盘': f"{trade['k1_open']:.2f}",
                     'K1最高': f"{trade['k1_high']:.2f}",
                     'K1最低': f"{trade['k1_low']:.2f}",
+                    'K1收盘': f"{trade['k1_close']:.2f}",
+                    'K2开盘': f"{trade['k2_open']:.2f}",
                     'K2最高': f"{trade['k2_high']:.2f}",
                     'K2最低': f"{trade['k2_low']:.2f}",
-                })
+                    'K2收盘': f"{trade['k2_close']:.2f}",
+                }
+                
+                # 如果是包含关系，添加K3信息
+                if 'k3_open' in trade:
+                    row_data['K3开盘'] = f"{trade['k3_open']:.2f}"
+                    row_data['K3最高'] = f"{trade['k3_high']:.2f}"
+                    row_data['K3最低'] = f"{trade['k3_low']:.2f}"
+                    row_data['K3收盘'] = f"{trade['k3_close']:.2f}"
+                else:
+                    row_data['K3开盘'] = ''
+                    row_data['K3最高'] = ''
+                    row_data['K3最低'] = ''
+                    row_data['K3收盘'] = ''
+                
+                writer.writerow(row_data)
         
         print(f"\n✓ 交易日志已导出到: {filename}")
         return filename
@@ -527,6 +611,8 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
             f.write("-"*80 + "\n")
             f.write(f"总信号数: {stats['total_signals']}\n")
             f.write(f"总交易数: {stats['total_trades']}\n")
+            f.write(f"包含关系交易数(rule2): {stats.get('rule2_trades', 0)} (胜: {stats.get('rule2_wins', 0)} / 负: {stats.get('rule2_losses', 0)})\n")
+            f.write(f"非包含关系交易数(rule1): {stats.get('rule1_trades', stats.get('total_trades', 0) - stats.get('rule2_trades', 0))} (胜: {stats.get('rule1_wins', stats.get('wins', 0) - stats.get('rule2_wins', 0))} / 负: {stats.get('rule1_losses', stats.get('losses', 0) - stats.get('rule2_losses', 0))})\n")
             f.write(f"盈利次数: {stats['wins']}\n")
             f.write(f"亏损次数: {stats['losses']}\n")
             f.write(f"胜率: {stats['win_rate']:.2f}%\n")
@@ -548,6 +634,7 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
             for trade in trade_details:
                 f.write(f"交易 #{trade['trade_id']} - {trade['result']} ({trade['direction']})\n")
                 f.write(f"  策略类型: {trade['signal_type']}\n")
+                f.write(f"  是否包含关系: {'是' if trade.get('signal_type') == 'rule2' else '否'}\n")
                 f.write(f"  交易方向: {trade['direction']}\n")
                 f.write(f"  入场时间: {trade['entry_time']}\n")
                 f.write(f"  入场价格: {trade['entry_price']:.2f} USDT\n")
@@ -558,8 +645,12 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
                 f.write(f"  合约收益: {trade['contract_return']:.2f}%\n")
                 f.write(f"  本次盈亏: {trade['pnl']:+.4f} USDT\n")
                 f.write(f"  累计盈亏: {trade['cumulative_capital']:+.4f} USDT\n")
-                f.write(f"  K1区间: [{trade['k1_low']:.2f} - {trade['k1_high']:.2f}]\n")
-                f.write(f"  K2区间: [{trade['k2_low']:.2f} - {trade['k2_high']:.2f}]\n")
+                f.write(f"  \n")
+                f.write(f"  K1 - 开:{trade['k1_open']:.2f} 高:{trade['k1_high']:.2f} 低:{trade['k1_low']:.2f} 收:{trade['k1_close']:.2f}\n")
+                f.write(f"  K2 - 开:{trade['k2_open']:.2f} 高:{trade['k2_high']:.2f} 低:{trade['k2_low']:.2f} 收:{trade['k2_close']:.2f}\n")
+                # 如果是包含关系，添加K3信息
+                if 'k3_open' in trade:
+                    f.write(f"  K3 - 开:{trade['k3_open']:.2f} 高:{trade['k3_high']:.2f} 低:{trade['k3_low']:.2f} 收:{trade['k3_close']:.2f}\n")
                 f.write("-"*80 + "\n")
         
         print(f"✓ 详细日志已导出到: {filename}")
@@ -588,11 +679,11 @@ def print_signal_details(signals: List[Dict], limit: int = 10):
 def main():
     """主函数"""
     # ====== 关键参数集中设置 ======
-    leverage = 50               # 杠杆倍数
+    leverage = 60              # 杠杆倍数
     profit_target_percent = 40  # 止盈百分比（合约收益%）
-    stop_loss_percent = 99      # 止损百分比（合约亏损%）
+    stop_loss_percent = 100      # 止损百分比（合约亏损%）
     initial_capital = 1.0       # 每次投入资金（USDT）
-    min_k1_range_percent = 0.44  # 第一根K线开收涨跌幅要求（%）
+    min_k1_range_percent = 0.21  # 第一根K线开收涨跌幅要求（%）
     # ==============================
     
     # 计算现货价格需要变动的百分比
@@ -662,16 +753,18 @@ def main():
     signals = strategy.find_signals(klines, 
                                     profit_target=price_profit_target,
                                     stop_loss=price_stop_loss,
-                                    min_k1_range=min_k1_range)
-    print(f"找到 {len(signals)} 个已平仓交易 (触发止盈/止损)")
-    
-    # 打印信号详情
-    print_signal_details(signals, limit=5)
-    
-    # 计算胜率
-    print("\n正在计算统计数据...")
-    stats = strategy.calculate_win_rate(signals, leverage=leverage, initial_capital=initial_capital)
-    
+                                    min_k1_range=min_k1_range,
+                                    filter_overlap_within_10_bars=True)  # 启用十根K线内过滤
+    print(f"找到 {len(signals)} 个已平仓交易 (触发止盈/止损，已过滤十根K线内重叠)")
+
+    # 过滤掉包含关系（type == 'rule2'）
+    filtered_signals = [s for s in signals if s.get('type') != 'rule2']
+    print(f"（已过滤包含关系）排除后 {len(filtered_signals)} 个交易将用于打印和导出日志")
+
+    # 计算胜率（使用过滤后的信号）
+    print("\n正在计算统计数据...（排除包含关系）")
+    stats = strategy.calculate_win_rate(filtered_signals, leverage=leverage, initial_capital=initial_capital)
+
     # 附加关键参数到stats，便于导出txt时动态展示
     stats['leverage'] = leverage
     stats['profit_target_percent'] = profit_target_percent
@@ -689,6 +782,8 @@ def main():
     print(f"每次投入: {initial_capital} USDT")
     print(f"{'-'*80}")
     print(f"总交易数: {stats['total_trades']} (仅统计已触发止盈/止损的交易)")
+    print(f"包含关系交易数(rule2): {stats.get('rule2_trades', 0)} (胜: {stats.get('rule2_wins', 0)} / 负: {stats.get('rule2_losses', 0)})")
+    print(f"非包含关系交易数(rule1): {stats.get('rule1_trades', 0)} (胜: {stats.get('rule1_wins', 0)} / 负: {stats.get('rule1_losses', 0)})")
     print(f"盈利次数: {stats['wins']} (止盈)")
     print(f"亏损次数: {stats['losses']} (止损)")
     print(f"胜率: {stats['win_rate']:.2f}%")
@@ -730,10 +825,10 @@ def main():
     print("导出交易日志")
     print(f"{'='*80}")
     
-    # 导出CSV格式（适合Excel分析）
+    # 导出CSV格式（适合Excel分析） - 使用已过滤的交易详情
     csv_file = export_to_csv(stats['trade_details'])
-    
-    # 导出TXT格式（适合阅读）
+
+    # 导出TXT格式（适合阅读） - 使用已过滤的交易详情
     txt_file = export_to_txt(stats['trade_details'], stats)
     
     print(f"\n日志文件已保存在当前目录下")
