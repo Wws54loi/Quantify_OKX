@@ -140,7 +140,6 @@ class ThreeKlineStrategy:
         - 第一根K线的开盘价和收盘价必须有起码0.5%的涨跌幅
         - 第二根K线的最低价或最高价突破第一根K线
         - 但第二根K线的实体部分仍在第一根K线范围内
-        - K2实体柱与K1实体柱的比值必须在0.5-1.6之间
         
         参数:
             k1: 第一根K线
@@ -161,20 +160,6 @@ class ThreeKlineStrategy:
         if not body_in_range:
             return (False, None)
         
-        # 检查K2实体柱与K1实体柱的比值
-        k1_body_size = abs(k1.close - k1.open)
-        k2_body_size = abs(k2.close - k2.open)
-        
-        # 避免除零错误
-        if k1_body_size == 0:
-            return (False, None)
-        
-        body_ratio = k2_body_size / k1_body_size
-        
-        # K2实体柱与K1实体柱的比值必须在0.5-1.6之间
-        if body_ratio < 0.5 or body_ratio > 1.6:
-            return (False, None)
-        
         # 向下突破 -> 做多信号（预期反弹）
         if k2.low < k1.low:
             return (True, 'long')
@@ -191,10 +176,7 @@ class ThreeKlineStrategy:
                     min_k1_range: float = 0.005,
                     max_holding_bars_tp: int = None,
                     max_holding_bars_sl: int = None,
-                    allow_stop_loss_retry: bool = True,
-                    switch_bars: int = 35,
-                    after_50_bars_tp_ratio: float = 0.9,
-                    after_50_bars_sl_ratio: float = 0.3) -> List[Dict]:
+                    allow_stop_loss_retry: bool = True) -> List[Dict]:
         """
         查找所有交易信号并模拟持仓直到触发止盈/止损
         
@@ -206,9 +188,6 @@ class ThreeKlineStrategy:
             max_holding_bars_tp: 止盈超时阈值(根K线数)，超过此时间未止盈则平仓
             max_holding_bars_sl: 止损超时阈值(根K线数)，超过此时间未止损则平仓
             allow_stop_loss_retry: 是否允许第一次触及止损点时不平仓，第二次才止损
-            switch_bars: 多少根K线后切换止盈止损点，默认50根
-            after_50_bars_tp_ratio: N根K线后的止盈比例，默认1.0不变，<1降低，>1提高
-            after_50_bars_sl_ratio: N根K线后的止损比例，默认1.0不变，<1降低，>1提高
         
         返回:
             信号列表(仅包含已触发止盈/止损的交易)
@@ -257,20 +236,11 @@ class ThreeKlineStrategy:
                 direction = signal['direction']
                 stop_loss_hit_count = 0  # 止损触发次数计数器
                 
-                # 从入场后的第一根K线开始监测（只监测前100根K线）
-                max_check_bars = len(klines)
-
-                # max_check_bars = min(entry_index + 50, len(klines))
+                # 从入场后的第一根K线开始监测（只监测前10根K线）
+                max_check_bars = min(entry_index + 10, len(klines))
                 for j in range(entry_index, max_check_bars):
                     current_kline = klines[j]
                     holding_bars = j - entry_index + 1
-                    
-                    # 动态调整止盈止损点：N根K线后使用新的比例
-                    current_profit_target = profit_target
-                    current_stop_loss = stop_loss
-                    if holding_bars > switch_bars:
-                        current_profit_target = profit_target * after_50_bars_tp_ratio
-                        current_stop_loss = stop_loss * after_50_bars_sl_ratio
                     
                     # 计算收益率
                     if direction == 'long':
@@ -283,30 +253,30 @@ class ThreeKlineStrategy:
                         current_return = (entry_price - current_kline.close) / entry_price
                     
                     # 检查是否触发止盈
-                    if high_return >= current_profit_target:
+                    if high_return >= profit_target:
                         signal['exit_type'] = 'take_profit'
-                        signal['exit_price'] = entry_price * (1 + current_profit_target) if direction == 'long' else entry_price * (1 - current_profit_target)
+                        signal['exit_price'] = entry_price * (1 + profit_target) if direction == 'long' else entry_price * (1 - profit_target)
                         signal['exit_time'] = current_kline.timestamp
                         signal['exit_index'] = j
                         signal['holding_bars'] = holding_bars
-                        signal['return'] = current_profit_target
+                        signal['return'] = profit_target
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
                         signals.append(signal)
                         in_position = False
                         break
                     # 检查是否触发止损
-                    elif low_return <= -current_stop_loss:
+                    elif low_return <= -stop_loss:
                         stop_loss_hit_count += 1
                         # 如果允许重试且是第一次触及止损，继续持仓
                         if allow_stop_loss_retry and stop_loss_hit_count == 1:
                             continue
                         # 第二次触及止损或不允许重试，则平仓
                         signal['exit_type'] = 'stop_loss'
-                        signal['exit_price'] = entry_price * (1 - current_stop_loss) if direction == 'long' else entry_price * (1 + current_stop_loss)
+                        signal['exit_price'] = entry_price * (1 - stop_loss) if direction == 'long' else entry_price * (1 + stop_loss)
                         signal['exit_time'] = current_kline.timestamp
                         signal['exit_index'] = j
                         signal['holding_bars'] = holding_bars
-                        signal['return'] = -current_stop_loss
+                        signal['return'] = -stop_loss
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
                         signals.append(signal)
                         in_position = False
@@ -665,9 +635,9 @@ def print_signal_details(signals: List[Dict], limit: int = 10):
 def main():
     """主函数"""
     # ====== 关键参数集中设置 ======
-    leverage = 140              # 杠杆倍数
-    profit_target_percent = 330  # 止盈百分比（合约收益%）
-    stop_loss_percent = 530       # 止损百分比（合约亏损%）
+    leverage = 40              # 杠杆倍数
+    profit_target_percent = 40  # 止盈百分比（合约收益%）
+    stop_loss_percent = 100       # 止损百分比（合约亏损%）
     initial_capital = 1.0       # 每次投入资金（USDT）
     min_k1_range_percent = 0.21  # 第一根K线开收涨跌幅要求（%）
     # ==============================

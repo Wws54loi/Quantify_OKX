@@ -194,9 +194,16 @@ class ThreeKlineStrategy:
                     allow_stop_loss_retry: bool = True,
                     switch_bars: int = 35,
                     after_50_bars_tp_ratio: float = 0.9,
-                    after_50_bars_sl_ratio: float = 0.3) -> List[Dict]:
+                    after_50_bars_sl_ratio: float = 0.3,
+                    after_100_bars_tp_ratio: float = 1.0,
+                    after_100_bars_sl_ratio: float = 1.0,
+                    trailing_stop_percent: float = None,
+                    max_concurrent_positions: int = 5) -> List[Dict]:
         """
-        查找所有交易信号并模拟持仓直到触发止盈/止损
+                查找所有交易信号并模拟持仓直到触发止盈/止损。
+                支持两级动态调整：
+                    1) 超过 switch_bars 根K线后，用 after_50_bars_tp_ratio / after_50_bars_sl_ratio 调整
+                    2) 超过 100 根K线后，再乘以 after_100_bars_tp_ratio / after_100_bars_sl_ratio 形成二次调整
         
         参数:
             klines: K线列表
@@ -209,15 +216,27 @@ class ThreeKlineStrategy:
             switch_bars: 多少根K线后切换止盈止损点，默认50根
             after_50_bars_tp_ratio: N根K线后的止盈比例，默认1.0不变，<1降低，>1提高
             after_50_bars_sl_ratio: N根K线后的止损比例，默认1.0不变，<1降低，>1提高
+            trailing_stop_percent: 跟踪止损比例(小数形式，如0.03表示3%)，None表示不启用
+            max_concurrent_positions: 最大同时持仓数量，默认5笔
         
         返回:
             信号列表(仅包含已触发止盈/止损的交易)
         """
         signals = []
+        active_positions = []  # 活跃持仓列表: [{'entry_index': int, 'exit_index': int}, ...]
         i = 0
         in_position = False  # 是否持仓中
         
         while i < len(klines) - 2:
+            # 清理已平仓的持仓(出场时间<=当前时间)
+            current_time = klines[i].timestamp
+            active_positions = [pos for pos in active_positions if pos['exit_index'] > i]
+            
+            # 检查是否达到最大持仓数限制
+            if len(active_positions) >= max_concurrent_positions:
+                i += 1
+                continue
+            
             # 如果已经持仓,跳过新信号检测
             if in_position:
                 i += 1
@@ -238,6 +257,9 @@ class ThreeKlineStrategy:
             else:
                 is_valid, direction = self.check_rule1(k1, k2, min_k1_range)
                 if is_valid:
+                    # 计算K1的实际涨跌幅(用于分阶段仓位)
+                    k1_actual_range = abs(k1.close - k1.open) / k1.open * 100
+                    
                     signal = {
                         'type': 'rule1',
                         'direction': direction,
@@ -245,10 +267,16 @@ class ThreeKlineStrategy:
                         'k2': k2,
                         'entry_price': k2.close,
                         'entry_time': k2.timestamp,
-                        'entry_index': i + 1
+                        'entry_index': i + 1,
+                        'k1_range_percent': k1_actual_range  # 记录K1涨跌幅(%)
                     }
                     entry_index = i + 2  # 从下一根K线开始监测
                     in_position = True
+                    
+                    # 添加临时持仓记录(出场index稍后更新)
+                    temp_position = {'entry_index': i + 1, 'exit_index': len(klines)}
+                    active_positions.append(temp_position)
+                    
                     i += 1  # 跳到入场K线位置
             
             # 如果有信号,持续监测直到触发止盈/止损
@@ -257,10 +285,18 @@ class ThreeKlineStrategy:
                 direction = signal['direction']
                 stop_loss_hit_count = 0  # 止损触发次数计数器
                 
+                # 跟踪止损相关变量
+                highest_price = entry_price  # 记录最高价（做多）
+                lowest_price = entry_price   # 记录最低价（做空）
+                trailing_stop_price = None   # 跟踪止损价
+                min_profit_for_trailing = profit_target * 0.3  # 达到止盈目标30%后启用跟踪止损
+                trailing_activated = False     # 跟踪止损是否已激活
+                trailing_enable_after_bars = switch_bars  # 在N根K线后才允许启用跟踪止损
+                
                 # 从入场后的第一根K线开始监测（只监测前100根K线）
                 max_check_bars = len(klines)
 
-                # max_check_bars = min(entry_index + 50, len(klines))
+                # max_check_bars = min(entry_index +50, len(klines))
                 for j in range(entry_index, max_check_bars):
                     current_kline = klines[j]
                     holding_bars = j - entry_index + 1
@@ -268,19 +304,60 @@ class ThreeKlineStrategy:
                     # 动态调整止盈止损点：N根K线后使用新的比例
                     current_profit_target = profit_target
                     current_stop_loss = stop_loss
-                    if holding_bars > switch_bars:
+                    # 两级动态调整：先判断是否超过100根，再判断是否超过switch_bars
+                    if holding_bars > 100:
+                        current_profit_target = profit_target * after_50_bars_tp_ratio * after_100_bars_tp_ratio
+                        current_stop_loss = stop_loss * after_50_bars_sl_ratio * after_100_bars_sl_ratio
+                    elif holding_bars > switch_bars:
                         current_profit_target = profit_target * after_50_bars_tp_ratio
                         current_stop_loss = stop_loss * after_50_bars_sl_ratio
                     
                     # 计算收益率
                     if direction == 'long':
+                        # 更新最高价
+                        if current_kline.high > highest_price:
+                            highest_price = current_kline.high
+                        
                         high_return = (current_kline.high - entry_price) / entry_price
                         low_return = (current_kline.low - entry_price) / entry_price
                         current_return = (current_kline.close - entry_price) / entry_price
+                        
+                        # 跟踪止损逻辑（做多）- 只在持仓超过N根K线后才启用
+                        if trailing_stop_percent is not None and holding_bars > trailing_enable_after_bars:
+                            # 检查是否达到最低收益率要求
+                            if not trailing_activated and high_return >= min_profit_for_trailing:
+                                trailing_activated = True
+                                trailing_stop_price = highest_price * (1 - trailing_stop_percent)
+                                print(f"  [跟踪止损激活] 交易方向:做多, 入场价:{entry_price:.2f}, 最高价:{highest_price:.2f}, 初始止损价:{trailing_stop_price:.2f}, 持仓:{holding_bars}根K线")
+                            
+                            # 如果已激活，更新跟踪止损价
+                            elif trailing_activated:
+                                new_trailing_stop = highest_price * (1 - trailing_stop_percent)
+                                if new_trailing_stop > trailing_stop_price:
+                                    trailing_stop_price = new_trailing_stop
+                        
                     else:  # short
+                        # 更新最低价
+                        if current_kline.low < lowest_price:
+                            lowest_price = current_kline.low
+                        
                         high_return = (entry_price - current_kline.low) / entry_price
                         low_return = (entry_price - current_kline.high) / entry_price
                         current_return = (entry_price - current_kline.close) / entry_price
+                        
+                        # 跟踪止损逻辑（做空）- 只在持仓超过N根K线后才启用
+                        if trailing_stop_percent is not None and holding_bars > trailing_enable_after_bars:
+                            # 检查是否达到最低收益率要求
+                            if not trailing_activated and high_return >= min_profit_for_trailing:
+                                trailing_activated = True
+                                trailing_stop_price = lowest_price * (1 + trailing_stop_percent)
+                                print(f"  [跟踪止损激活] 交易方向:做空, 入场价:{entry_price:.2f}, 最低价:{lowest_price:.2f}, 初始止损价:{trailing_stop_price:.2f}, 持仓:{holding_bars}根K线")
+                            
+                            # 如果已激活，更新跟踪止损价
+                            elif trailing_activated:
+                                new_trailing_stop = lowest_price * (1 + trailing_stop_percent)
+                                if new_trailing_stop < trailing_stop_price:
+                                    trailing_stop_price = new_trailing_stop
                     
                     # 检查是否触发止盈
                     if high_return >= current_profit_target:
@@ -291,11 +368,65 @@ class ThreeKlineStrategy:
                         signal['holding_bars'] = holding_bars
                         signal['return'] = current_profit_target
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
+                        signal['trailing_activated'] = trailing_activated
+                        signal['highest_price'] = highest_price if direction == 'long' else None
+                        signal['lowest_price'] = lowest_price if direction == 'short' else None
                         signals.append(signal)
+                        temp_position['exit_index'] = j  # 更新平仓位置
                         in_position = False
                         break
-                    # 检查是否触发止损
-                    elif low_return <= -current_stop_loss:
+                    
+                    # 检查跟踪止损（优先级高于固定止损，但不能超过最大止损限制）
+                    elif trailing_activated and trailing_stop_price is not None:
+                        trailing_stop_triggered = False
+                        
+                        if direction == 'long':
+                            # 做多：价格跌破跟踪止损价
+                            if current_kline.low <= trailing_stop_price:
+                                trailing_stop_triggered = True
+                                actual_exit_price = trailing_stop_price
+                        else:  # short
+                            # 做空：价格突破跟踪止损价
+                            if current_kline.high >= trailing_stop_price:
+                                trailing_stop_triggered = True
+                                actual_exit_price = trailing_stop_price
+                        
+                        if trailing_stop_triggered:
+                            # 计算实际收益率
+                            if direction == 'long':
+                                actual_return = (actual_exit_price - entry_price) / entry_price
+                            else:
+                                actual_return = (entry_price - actual_exit_price) / entry_price
+                            
+                            # 关键修复：如果跟踪止损的亏损超过了固定止损点，强制使用固定止损点
+                            # 注意：只有当亏损真的超过固定止损时才修正，否则保持跟踪止损的结果
+                            if actual_return < -current_stop_loss:
+                                # 亏损超限，强制使用固定止损价
+                                actual_return = -current_stop_loss
+                                actual_exit_price = entry_price * (1 - current_stop_loss) if direction == 'long' else entry_price * (1 + current_stop_loss)
+                                signal['exit_type'] = 'stop_loss'
+                            else:
+                                # 跟踪止损正常工作（可能是盈利也可能是小额亏损，但未超过固定止损点）
+                                signal['exit_type'] = 'trailing_stop'
+                            
+                            signal['exit_price'] = actual_exit_price
+                            signal['exit_time'] = current_kline.timestamp
+                            signal['exit_index'] = j
+                            signal['holding_bars'] = holding_bars
+                            signal['return'] = actual_return
+                            signal['stop_loss_hit_count'] = stop_loss_hit_count
+                            signal['trailing_activated'] = trailing_activated
+                            signal['highest_price'] = highest_price if direction == 'long' else None
+                            signal['lowest_price'] = lowest_price if direction == 'short' else None
+                            signal['trailing_stop_price'] = trailing_stop_price
+                            signals.append(signal)
+                            temp_position['exit_index'] = j  # 更新平仓位置
+                            in_position = False
+                            print(f"  [跟踪止损触发] 出场价:{actual_exit_price:.2f}, 收益率:{actual_return*100:.2f}%, 类型:{signal['exit_type']}")
+                            break
+                    
+                    # 检查是否触发固定止损（仅在跟踪止损未激活时检查）
+                    if not trailing_activated and low_return <= -current_stop_loss:
                         stop_loss_hit_count += 1
                         # 如果允许重试且是第一次触及止损，继续持仓
                         if allow_stop_loss_retry and stop_loss_hit_count == 1:
@@ -308,7 +439,9 @@ class ThreeKlineStrategy:
                         signal['holding_bars'] = holding_bars
                         signal['return'] = -current_stop_loss
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
+                        signal['trailing_activated'] = trailing_activated
                         signals.append(signal)
+                        temp_position['exit_index'] = j  # 更新平仓位置
                         in_position = False
                         break
                     # 检查止盈超时（如果设置了）
@@ -320,7 +453,9 @@ class ThreeKlineStrategy:
                         signal['holding_bars'] = holding_bars
                         signal['return'] = current_return
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
+                        signal['trailing_activated'] = trailing_activated
                         signals.append(signal)
+                        temp_position['exit_index'] = j  # 更新平仓位置
                         in_position = False
                         break
                     # 检查止损超时（如果设置了）
@@ -332,12 +467,16 @@ class ThreeKlineStrategy:
                         signal['holding_bars'] = holding_bars
                         signal['return'] = current_return
                         signal['stop_loss_hit_count'] = stop_loss_hit_count
+                        signal['trailing_activated'] = trailing_activated
                         signals.append(signal)
+                        temp_position['exit_index'] = j  # 更新平仓位置
                         in_position = False
                         break
                 
-                # 如果循环结束还没触发,说明前10根K线内未触发止盈/止损,不纳入统计
+                # 如果循环结束还没触发,说明未触发止盈/止损,不纳入统计
                 if in_position:
+                    # 从active_positions中移除这个未成交的持仓
+                    active_positions = [pos for pos in active_positions if pos != temp_position]
                     in_position = False
                     
             i += 1
@@ -347,14 +486,20 @@ class ThreeKlineStrategy:
     
     def calculate_win_rate(self, signals: List[Dict], 
                           leverage: int = 50,
-                          initial_capital: float = 1.0) -> Dict:  # 杠杆倍数和每次投入资金
+                          initial_capital: float = 1.0,
+                          position_tiers: List[Dict] = None) -> Dict:  # 新增分阶段仓位配置
         """
         计算胜率(信号已经包含止盈/止损信息)
         
         参数:
             signals: 信号列表(已触发止盈/止损)
             leverage: 杠杆倍数
-            initial_capital: 每次交易投入的本金(USDT)
+            initial_capital: 基础投入本金(USDT),当position_tiers为None时使用
+            position_tiers: 分阶段仓位配置列表,格式:
+                [{'threshold': 0.30, 'capital': 1.5},  # K1涨跌幅>=0.30%时投入1.5U
+                 {'threshold': 0.40, 'capital': 2.0},  # K1涨跌幅>=0.40%时投入2.0U
+                 ...]
+                如果为None则使用固定initial_capital
         
         返回:
             统计结果字典
@@ -384,6 +529,7 @@ class ThreeKlineStrategy:
         trade_details = []  # 存储每笔交易详情
         
         total_capital = 0.0  # 累计资金
+        total_investment = 0.0  # 总投入本金
         
         for idx, signal in enumerate(signals, 1):
             entry_price = signal['entry_price']
@@ -395,8 +541,25 @@ class ThreeKlineStrategy:
             
             holding_bars_list.append(holding_bars)
             
+            # 根据K1涨跌幅动态确定本次投入本金
+            k1_range = signal.get('k1_range_percent', 0)
+            if position_tiers:
+                # 使用分阶段仓位配置
+                # 按阈值从高到低排序,找到第一个满足条件的档位
+                sorted_tiers = sorted(position_tiers, key=lambda x: x['threshold'], reverse=True)
+                trade_capital = initial_capital  # 默认使用基础本金
+                for tier in sorted_tiers:
+                    if k1_range >= tier['threshold']:
+                        trade_capital = tier['capital']
+                        break
+            else:
+                # 使用固定本金
+                trade_capital = initial_capital
+            
+            total_investment += trade_capital
+            
             # 计算本次交易盈亏(USDT)
-            pnl = initial_capital * return_pct * leverage
+            pnl = trade_capital * return_pct * leverage
             total_capital += pnl
             
             # 判断盈亏
@@ -404,6 +567,10 @@ class ThreeKlineStrategy:
                 wins += 1
                 profits.append(return_pct)
                 result = '止盈'
+            elif exit_type == 'trailing_stop':
+                wins += 1
+                profits.append(return_pct)
+                result = '跟踪止损'
             elif exit_type == 'timeout_profit':
                 wins += 1
                 profits.append(return_pct)
@@ -419,7 +586,7 @@ class ThreeKlineStrategy:
             # 统计包含关系（rule2）
             if signal.get('type') == 'rule2':
                 rule2_trades += 1
-                if result in ('止盈', '超时止盈'):
+                if result in ('止盈', '跟踪止损', '超时止盈'):
                     rule2_wins += 1
                 else:
                     rule2_losses += 1
@@ -439,11 +606,17 @@ class ThreeKlineStrategy:
                 'exit_price': exit_price,
                 'holding_bars': holding_bars,
                 'holding_time': f"{holding_bars * 15}分钟",
+                'k1_range_percent': k1_range,  # K1涨跌幅
+                'trade_capital': trade_capital,  # 本次投入本金
                 'price_change_percent': price_change_percent,
                 'contract_return': contract_return,
                 'pnl': pnl,
                 'cumulative_capital': total_capital,
                 'result': result,
+                'trailing_activated': signal.get('trailing_activated', False),
+                'highest_price': signal.get('highest_price'),
+                'lowest_price': signal.get('lowest_price'),
+                'trailing_stop_price': signal.get('trailing_stop_price'),
                 # K1信息（完整）
                 'k1_open': signal['k1'].open,
                 'k1_high': signal['k1'].high,
@@ -482,9 +655,10 @@ class ThreeKlineStrategy:
             'avg_holding_bars': avg_holding_bars,
             'avg_holding_time': f"{avg_holding_bars * 15:.1f}分钟",
             'initial_capital_per_trade': initial_capital,
+            'total_investment': total_investment,  # 实际总投入
             'total_capital': total_capital,
             'total_pnl': total_capital,
-            'final_capital': total_trades * initial_capital + total_capital,
+            'final_capital': total_investment + total_capital,
             'profit_factor': abs(sum(profits) / sum(losses_list)) if losses_list and sum(losses_list) != 0 else float('inf'),
             'trade_details': trade_details,
             'rule2_trades': rule2_trades,
@@ -506,7 +680,7 @@ def export_to_csv(trade_details: List[Dict], filename: str = "trade_log.csv"):
     fieldnames = [
         '交易编号', '策略类型', '包含关系', '方向', '入场时间', '入场价格', 
         '出场时间', '出场价格', '持仓K线数', '持仓时长', '价格变动%', '合约收益%', 
-        '盈亏USDT', '累计资金USDT', '结果', 
+        '盈亏USDT', '累计资金USDT', '结果', '跟踪止损激活', '最高价', '最低价', '跟踪止损价',
         'K1开盘', 'K1最高', 'K1最低', 'K1收盘',
         'K2开盘', 'K2最高', 'K2最低', 'K2收盘',
         'K3开盘', 'K3最高', 'K3最低', 'K3收盘'
@@ -534,6 +708,10 @@ def export_to_csv(trade_details: List[Dict], filename: str = "trade_log.csv"):
                     '盈亏USDT': f"{trade['pnl']:.4f}",
                     '累计资金USDT': f"{trade['cumulative_capital']:.4f}",
                     '结果': trade['result'],
+                    '跟踪止损激活': '是' if trade.get('trailing_activated') else '否',
+                    '最高价': f"{trade['highest_price']:.2f}" if trade.get('highest_price') else '',
+                    '最低价': f"{trade['lowest_price']:.2f}" if trade.get('lowest_price') else '',
+                    '跟踪止损价': f"{trade['trailing_stop_price']:.2f}" if trade.get('trailing_stop_price') else '',
                     'K1开盘': f"{trade['k1_open']:.2f}",
                     'K1最高': f"{trade['k1_high']:.2f}",
                     'K1最低': f"{trade['k1_low']:.2f}",
@@ -631,6 +809,15 @@ def export_to_txt(trade_details: List[Dict], stats: Dict, filename: str = "trade
                 f.write(f"  合约收益: {trade['contract_return']:.2f}%\n")
                 f.write(f"  本次盈亏: {trade['pnl']:+.4f} USDT\n")
                 f.write(f"  累计盈亏: {trade['cumulative_capital']:+.4f} USDT\n")
+                f.write(f"  跟踪止损: {'已激活' if trade.get('trailing_activated') else '未激活'}\n")
+                if trade.get('trailing_activated'):
+                    # 安全地格式化highest_price和lowest_price
+                    if trade.get('highest_price') is not None:
+                        f.write(f"  最高价: {trade['highest_price']:.2f} USDT\n")
+                    if trade.get('lowest_price') is not None:
+                        f.write(f"  最低价: {trade['lowest_price']:.2f} USDT\n")
+                    if trade.get('trailing_stop_price') is not None:
+                        f.write(f"  跟踪止损价: {trade['trailing_stop_price']:.2f} USDT\n")
                 f.write(f"  \n")
                 f.write(f"  K1 - 开:{trade['k1_open']:.2f} 高:{trade['k1_high']:.2f} 低:{trade['k1_low']:.2f} 收:{trade['k1_close']:.2f}\n")
                 f.write(f"  K2 - 开:{trade['k2_open']:.2f} 高:{trade['k2_high']:.2f} 低:{trade['k2_low']:.2f} 收:{trade['k2_close']:.2f}\n")
@@ -670,12 +857,31 @@ def main():
     stop_loss_percent = 530       # 止损百分比（合约亏损%）
     initial_capital = 1.0       # 每次投入资金（USDT）
     min_k1_range_percent = 0.21  # 第一根K线开收涨跌幅要求（%）
+    # 0.47/0.42收益确实很高 做的交易笔数相对减少 不适宜做策略的推敲，但是后续可以改为0.47
+    trailing_stop_percent = 8.0  # 跟踪止损百分比（%），None表示不启用
+    switch_bars = 40            # 多少根K线后切换止盈止损和启用跟踪止损
+    max_concurrent_positions = 2  # 最大同时持仓数量
+    # 新增二级动态调整参数候选遍历: 超过100根K线后的倍率
+    after_100_tp_values = [1.0, 0.9, 0.8, 1.1, 1.2, 0.7]
+    after_100_sl_values = [1.0, 0.9, 0.8, 1.1, 1.2, 0.7]
+    perform_after_100_search = True  # 是否执行参数遍历
+    
+    # 分阶段仓位配置 - 根据K1涨跌幅动态调整投入本金
+    # 设置为None则使用固定initial_capital
+    # 最佳ROI(遍历): >=0.48%->2.6U, >=0.30%->1.6U, >=0.21%->1.0U
+    position_tiers = [
+        {'threshold': 0.48, 'capital': 2.6},   # 强信号
+        {'threshold': 0.30, 'capital': 1.6},   # 中等信号
+        {'threshold': 0.21, 'capital': 1.0},   # 基准
+    ]
+    # 不使用分阶段仓位,设置为: position_tiers = None
     # ==============================
     
     # 计算现货价格需要变动的百分比
     price_profit_target = profit_target_percent / leverage / 100
     price_stop_loss = stop_loss_percent / leverage / 100
     min_k1_range = min_k1_range_percent / 100
+    trailing_stop = trailing_stop_percent / 100 if trailing_stop_percent is not None else None
     
     print("="*80)
     print("三K线策略胜率统计系统")
@@ -684,6 +890,10 @@ def main():
     print(f"K线周期: 15分钟")
     print(f"交易模式: 合约 ({leverage}倍杠杆)")
     print(f"数据来源: 币安API")
+    print(f"持仓限制: 最多同时持有 {max_concurrent_positions} 笔")
+    if trailing_stop is not None:
+        activation_threshold = price_profit_target * 0.3 * 100
+        print(f"跟踪止损: {trailing_stop_percent}% (持仓>{switch_bars}根K线且达到{activation_threshold:.3f}%现货收益后启用)")
     print("="*80)
     
     # K线数据缓存文件
@@ -736,16 +946,77 @@ def main():
     # 查找信号
     print("\n正在分析K线形态并模拟交易...")
     
-    signals = strategy.find_signals(klines, 
+    best_after_100_tp = 1.0
+    best_after_100_sl = 1.0
+    signals = []
+
+    if perform_after_100_search:
+        print("\n开始遍历 >100根K线后的TP/SL倍率参数...")
+        combo_results = []
+        for tp_r in after_100_tp_values:
+            for sl_r in after_100_sl_values:
+                cur_signals = strategy.find_signals(klines,
+                                                    profit_target=price_profit_target,
+                                                    stop_loss=price_stop_loss,
+                                                    min_k1_range=min_k1_range,
+                                                    switch_bars=switch_bars,
+                                                    after_50_bars_tp_ratio=0.9,
+                                                    after_50_bars_sl_ratio=0.3,
+                                                    after_100_bars_tp_ratio=tp_r,
+                                                    after_100_bars_sl_ratio=sl_r,
+                                                    trailing_stop_percent=trailing_stop,
+                                                    max_concurrent_positions=max_concurrent_positions)
+                stats_tmp = strategy.calculate_win_rate(cur_signals,
+                                                        leverage=leverage,
+                                                        initial_capital=initial_capital,
+                                                        position_tiers=position_tiers)
+                combo_results.append({
+                    'tp_ratio_100': tp_r,
+                    'sl_ratio_100': sl_r,
+                    'total_pnl': stats_tmp['total_pnl'],
+                    'profit_factor': stats_tmp['profit_factor'],
+                    'win_rate': stats_tmp['win_rate'],
+                    'trades': stats_tmp['total_trades']
+                })
+        # 按总盈亏排序
+        combo_results.sort(key=lambda x: x['total_pnl'], reverse=True)
+        print("\nTop 8 组合 (按总盈亏排序):")
+        for r in combo_results[:8]:
+            print(f"  TP100={r['tp_ratio_100']:.2f} SL100={r['sl_ratio_100']:.2f} | 总盈亏={r['total_pnl']:+.4f} | 盈亏比={r['profit_factor']:.2f} | 胜率={r['win_rate']:.2f}% | 交易数={r['trades']}")
+        # 选择最优组合(可以基于profit_factor与total_pnl的简单加权)
+        best = max(combo_results, key=lambda x: (x['total_pnl'] * 0.7 + x['profit_factor'] * 0.3))
+        best_after_100_tp = best['tp_ratio_100']
+        best_after_100_sl = best['sl_ratio_100']
+        print(f"\n选择最优组合: TP100={best_after_100_tp:.2f}, SL100={best_after_100_sl:.2f}\n")
+
+    # 使用最优或默认组合重新计算最终signals
+    signals = strategy.find_signals(klines,
                                     profit_target=price_profit_target,
                                     stop_loss=price_stop_loss,
-                                    min_k1_range=min_k1_range)
-    print(f"找到 {len(signals)} 个已平仓交易 (触发止盈/止损)")
+                                    min_k1_range=min_k1_range,
+                                    switch_bars=switch_bars,
+                                    after_50_bars_tp_ratio=0.9,
+                                    after_50_bars_sl_ratio=0.3,
+                                    after_100_bars_tp_ratio=best_after_100_tp,
+                                    after_100_bars_sl_ratio=best_after_100_sl,
+                                    trailing_stop_percent=trailing_stop,
+                                    max_concurrent_positions=max_concurrent_positions)
+    print(f"最终使用参数下找到 {len(signals)} 个已平仓交易 (触发止盈/止损)")
+    
+    # 统计跟踪止损激活次数
+    trailing_activated_count = sum(1 for s in signals if s.get('trailing_activated'))
+    trailing_stop_exit_count = sum(1 for s in signals if s.get('exit_type') == 'trailing_stop')
+    if trailing_stop is not None:
+        print(f"跟踪止损激活次数: {trailing_activated_count}")
+        print(f"跟踪止损平仓次数: {trailing_stop_exit_count}")
     
     
     # 计算胜率
     print("\n正在计算统计数据...")
-    stats = strategy.calculate_win_rate(signals, leverage=leverage, initial_capital=initial_capital)
+    stats = strategy.calculate_win_rate(signals, 
+                                        leverage=leverage, 
+                                        initial_capital=initial_capital,
+                                        position_tiers=position_tiers)
     
     # 附加关键参数到stats，便于导出txt时动态展示
     stats['leverage'] = leverage
@@ -761,7 +1032,15 @@ def main():
     print(f"止盈设置: {profit_target_percent}% (价格变动 {price_profit_target*100:.2f}%)")
     print(f"止损设置: {stop_loss_percent}% (价格变动 {price_stop_loss*100:.2f}%)")
     print(f"K1涨跌幅要求: {min_k1_range_percent}%")
-    print(f"每次投入: {initial_capital} USDT")
+    if trailing_stop is not None:
+        activation_threshold = price_profit_target * 0.3 * 100
+        print(f"跟踪止损: {trailing_stop_percent}% (持仓>{switch_bars}根K线且达到{activation_threshold:.3f}%现货收益后启用)")
+    if position_tiers:
+        print(f"仓位管理: 分阶段加注")
+        for tier in sorted(position_tiers, key=lambda x: x['threshold'], reverse=True):
+            print(f"  K1涨跌幅 >= {tier['threshold']:.2f}%: 投入 {tier['capital']:.1f} USDT")
+    else:
+        print(f"仓位管理: 固定投入 {initial_capital} USDT")
     print(f"{'-'*80}")
     print(f"总交易数: {stats['total_trades']} (仅统计已触发止盈/止损的交易)")
     print(f"包含关系交易数(rule2): {stats.get('rule2_trades', 0)} (胜: {stats.get('rule2_wins', 0)} / 负: {stats.get('rule2_losses', 0)})")
@@ -773,12 +1052,18 @@ def main():
     print(f"平均亏损: {stats['avg_loss']*leverage:.2f}% (合约亏损)")
     print(f"平均持仓: {stats['avg_holding_bars']:.1f}根K线 ({stats['avg_holding_time']})")
     print(f"盈亏比: {stats['profit_factor']:.2f}")
+    if trailing_stop is not None:
+        print(f"{'-'*80}")
+        print(f"跟踪止损统计:")
+        print(f"  激活次数: {trailing_activated_count}")
+        print(f"  平仓次数: {trailing_stop_exit_count}")
     print(f"{'-'*80}")
-    print(f"资金管理 (每次投入 {initial_capital:.2f} USDT):")
-    print(f"  总投入: {stats['total_trades'] * initial_capital:.2f} USDT")
+    print(f"资金管理:")
+    print(f"  总投入: {stats['total_investment']:.2f} USDT")
+    print(f"  平均每笔: {stats['total_investment'] / stats['total_trades']:.2f} USDT")
     print(f"  总盈亏: {stats['total_pnl']:+.4f} USDT")
     print(f"  最终资金: {stats['final_capital']:.4f} USDT")
-    print(f"  总收益率: {(stats['total_pnl'] / (stats['total_trades'] * initial_capital) * 100):+.2f}%")
+    print(f"  总收益率: {(stats['total_pnl'] / stats['total_investment'] * 100):+.2f}%")
     print(f"{'='*80}")
     
     # 策略评估
