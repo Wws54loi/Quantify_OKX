@@ -1,25 +1,3 @@
-"""
-三K线策略胜率统计 - 币安BTC 15分钟K线
-作者: 
-日期: 2025-11-04
-
-交易模式: 合约交易 (50倍杠杆)
-止盈: 40% (价格变动0.8%)
-止损: 20% (价格变动0.4%)
-
-策略规则:
-法则1: 三K线策略
-  - 第一根K线的开盘价和收盘价必须有起码0.5%的涨跌幅
-  - 第二根K线的最低价或最高价突破第一根K线
-  - 但第二根K线的实体部分仍在第一根K线范围内
-  - 向下突破做多（预期反弹），向上突破做空（预期回落）
-  - 在第二根K线收盘价入场
-
-法则2: 包含关系处理
-  - 如果第二根K线的最高点和最低点都被包含在第一根K线里
-  - 则第三根K线执行法则1中第二根K线的规则
-"""
-
 import urllib.request
 import json
 import time
@@ -108,6 +86,12 @@ class KLine:
         self.low = float(kline_data[3])
         self.close = float(kline_data[4])
         self.volume = float(kline_data[5])
+        # 币安K线第7个字段为 close time（毫秒）
+        try:
+            self.close_time = int(kline_data[6])
+        except Exception:
+            # 兜底：按15分钟周期推算
+            self.close_time = int(self.timestamp + 15 * 60 * 1000)
         
         # 计算实体部分
         self.body_high = max(self.open, self.close)
@@ -194,7 +178,6 @@ class ThreeKlineStrategy:
                     min_k1_range: float = 0.005,
                     max_holding_bars_tp: int = None,
                     max_holding_bars_sl: int = None,
-                    allow_stop_loss_retry: bool = True,
                     switch_bars: int = 35,
                     after_50_bars_tp_ratio: float = 0.9,
                     after_50_bars_sl_ratio: float = 0.3,
@@ -226,7 +209,6 @@ class ThreeKlineStrategy:
             min_k1_range: K1最小涨跌幅要求 (小数形式，如0.005表示0.5%)
             max_holding_bars_tp: 止盈超时阈值(根K线数)，超过此时间未止盈则平仓
             max_holding_bars_sl: 止损超时阈值(根K线数)，超过此时间未止损则平仓
-            allow_stop_loss_retry: 是否允许第一次触及止损点时不平仓，第二次才止损
             switch_bars: 多少根K线后切换止盈止损点，默认50根
             after_50_bars_tp_ratio: N根K线后的止盈比例，默认1.0不变，<1降低，>1提高
             after_50_bars_sl_ratio: N根K线后的止损比例，默认1.0不变，<1降低，>1提高
@@ -284,7 +266,8 @@ class ThreeKlineStrategy:
                         'k1': k1,
                         'k2': k2,
                         'entry_price': k2.close,
-                        'entry_time': k2.timestamp,
+                        # 入场时间改为 K2 收盘时间（close_time）
+                        'entry_time': getattr(k2, 'close_time', k2.timestamp + 15 * 60 * 1000),
                         'entry_index': i + 1,
                 'k1_range_percent': k1_actual_range,  # 记录K1涨跌幅(%)
                 'underperf_adjusted': False  # 是否触发弱势收紧
@@ -504,9 +487,6 @@ class ThreeKlineStrategy:
                     # 检查是否触发固定止损（仅在跟踪止损未激活时检查）
                     if not trailing_activated and low_return <= -current_stop_loss:
                         stop_loss_hit_count += 1
-                        # 如果允许重试且是第一次触及止损，继续持仓
-                        if allow_stop_loss_retry and stop_loss_hit_count == 1:
-                            continue
                         # 第二次触及止损或不允许重试，则平仓
                         signal['exit_type'] = 'stop_loss'
                         signal['exit_price'] = entry_price * (1 - current_stop_loss) if direction == 'long' else entry_price * (1 + current_stop_loss)
