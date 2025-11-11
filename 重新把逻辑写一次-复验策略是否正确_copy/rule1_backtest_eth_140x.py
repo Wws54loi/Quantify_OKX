@@ -35,7 +35,7 @@ import json
 import csv
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import math
 import argparse
 
@@ -66,8 +66,9 @@ TXT_NAME = "rule1_results_eth_140x.txt"
 # ------------------------- 工具函数 -------------------------
 
 def ts_ms_to_str(ts_ms: int) -> str:
-    # Binance ms -> local naive string
-    return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    # Binance ms -> UTC+8 time string
+    utc8 = timezone(timedelta(hours=8))
+    return datetime.fromtimestamp(ts_ms / 1000.0, tz=utc8).strftime("%Y-%m-%d %H:%M")
 
 
 def body_strength(o: float, c: float) -> float:
@@ -215,13 +216,13 @@ class Position:
         trail_price = self.compute_trail_price()
         tp_price, sl_price = self.compute_fixed_prices()
 
-        # 1) 追踪优先（并对亏损做固定止损上限保护，不叠加）
+        # 1) 追踪止损优先（方案A：追踪激活后，固定止损不再检查）
         if trail_price is not None:
             if self.direction == 'long':
                 if bar.low <= trail_price:
                     # 以追踪价出场
                     actual_exit = trail_price
-                    # 计算价格维度的固定止损阈值
+                    # 计算固定止损价作为保护
                     _, sl_price = self.compute_fixed_prices()
                     # 若追踪导致的亏损超过固定SL，则强制以固定SL价出场
                     if actual_exit < sl_price:
@@ -248,8 +249,28 @@ class Position:
                     self.exit_price = actual_exit
                     self.exit_reason = reason
                     return True
+            
+            # 追踪激活后，检查止盈但不检查固定止损
+            if self.direction == 'long':
+                if bar.high >= tp_price:
+                    self.exit_index = idx
+                    self.exit_time = bar.close_time
+                    self.exit_price = tp_price
+                    self.exit_reason = 'TP'
+                    return True
+            else:
+                if bar.low <= tp_price:
+                    self.exit_index = idx
+                    self.exit_time = bar.close_time
+                    self.exit_price = tp_price
+                    self.exit_reason = 'TP'
+                    return True
+            
+            # 追踪激活后未触发任何出场条件，继续持仓
+            self.bars_held += 1
+            return False
 
-        # 2) 固定 SL/TP（不与追踪叠加）
+        # 2) 固定 SL/TP（仅在追踪未激活时检查）
         if self.direction == 'long':
             # 先看 SL
             if bar.low <= sl_price:
@@ -416,18 +437,25 @@ def backtest(klines: List[KLine], quick: bool = False) -> Tuple[List[Position], 
     bars_sum = 0
     trail_activated = 0
     trail_exited = 0
+    win_returns = []  # 盈利交易的收益率列表
+    loss_returns = []  # 亏损交易的收益率列表
 
     for p in positions:
         pnl = p.pnl_usdt()
+        contract_return = p.contract_return_pct()  # 合约收益率%
+        
         if pnl >= 0:
             wins += 1
             win_sum += pnl
+            win_returns.append(contract_return)
         else:
             losses += 1
             loss_sum += -pnl
-        # 使用 exit_index-entry_index+1 作为持仓根数，避免计数偏差
+            loss_returns.append(abs(contract_return))
+        # 使用 exit_index - entry_index 作为持仓根数（从入场K线开始计数）
+        # 例如：entry_index=138(K2入场), exit_index=180, 持仓=180-138=42根
         if p.exit_index is not None and p.entry_index is not None:
-            held = max(0, p.exit_index - p.entry_index + 1)
+            held = max(0, p.exit_index - p.entry_index)
         else:
             held = p.bars_held
         bars_sum += held
@@ -462,6 +490,9 @@ def backtest(klines: List[KLine], quick: bool = False) -> Tuple[List[Position], 
 def write_csv_txt(out_dir: str, klines: List[KLine], positions: List[Position]):
     csv_path = os.path.join(out_dir, CSV_NAME)
     txt_path = os.path.join(out_dir, TXT_NAME)
+
+    # 按交易ID排序，确保输出顺序正确
+    positions = sorted(positions, key=lambda p: p.id)
 
     # CSV
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
@@ -541,11 +572,6 @@ def write_csv_txt(out_dir: str, klines: List[KLine], positions: List[Position]):
     return csv_path, txt_path
 
 
-def load_json(path: str) -> List[List[Any]]:
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--quick', action='store_true', help='仅快速验证（~2000根）')
@@ -555,7 +581,25 @@ def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     json_path = os.path.join(base_dir, 'ethusdt_15m_klines.json')
 
-    raw = load_json(json_path)
+    # 读取K线数据（增强错误处理）
+    if not os.path.exists(json_path):
+        print(f"✗ 错误: 找不到K线数据文件 {json_path}")
+        print(f"  请确保 ethusdt_15m_klines.json 文件存在于脚本目录下")
+        return
+    
+    print(f"正在读取K线数据: {json_path}")
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+        print(f"✓ 成功读取 {len(raw)} 根K线数据")
+    except json.JSONDecodeError as e:
+        print(f"✗ JSON解析错误: {e}")
+        print(f"  文件可能损坏或格式不正确")
+        return
+    except Exception as e:
+        print(f"✗ 读取文件失败: {e}")
+        return
+    
     kl = parse_klines(raw, limit=args.limit)
 
     positions, total_pnl, stats = backtest(kl, quick=args.quick)
