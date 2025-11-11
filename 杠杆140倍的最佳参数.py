@@ -924,7 +924,7 @@ def main():
     default_underperf_sl_mult = 0.85
     default_underperf_trailing = 6.0  # 百分比表示
     switch_bars = 40            # 多少根K线后切换止盈止损和启用跟踪止损
-    max_concurrent_positions = 4  # 最大同时持仓数量
+    max_concurrent_positions = 1  # 最大同时持仓数量
     # 超过100根K线后的倍率（固定为默认1.0，不再遍历与打印对比）
     best_after_100_tp = 1.0
     best_after_100_sl = 1.0
